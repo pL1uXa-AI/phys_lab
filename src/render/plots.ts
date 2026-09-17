@@ -549,6 +549,119 @@ export function drawStructure(
 }
 
 /**
+ * Кривая фазового перехода: энергия и теплоёмкость от температуры.
+ *
+ * Особенность графика в том, что по X идёт НЕ время, а температура —
+ * параметр, который мы сами задаём. Поэтому ось X здесь равномерная по
+ * индексу точки, а не пропорциональная T: шаг свипа может быть неравномерным
+ * (у перехода его хочется мельче), и пропорциональная шкала сжимала бы
+ * интересную область перехода в точку.
+ *
+ * Две серии рисуются в разных масштабах (энергия порядка −5, теплоёмкость
+ * порядка 1), поэтому каждая нормируется на свой диапазон — иначе одна
+ * кривая была бы плоской линией на фоне другой. Для этого на графике две
+ * вертикальные шкалы с подписями.
+ */
+export function drawTransition(
+  canvas: HTMLCanvasElement,
+  points: ReadonlyArray<{ temperature: number; energy: number; heatCapacity: number }>,
+  options: { branch?: string; progress?: number } = {},
+): void {
+  const prepared = prepareCanvas(canvas);
+  if (!prepared) return;
+  const { ctx, cssHeight, box } = prepared;
+
+  if (points.length === 0) {
+    drawCaption(ctx, box, 'Фазовый переход', PLOT_COLORS.temperature, 'нет данных');
+    return;
+  }
+
+  const count = points.length;
+  // Равномерная шкала по индексу точки: см. комментарий выше.
+  const xOf = (index: number): number =>
+    box.left + (count <= 1 ? 0 : (index / (count - 1)) * box.plotWidth);
+
+  let eMin = Number.POSITIVE_INFINITY;
+  let eMax = Number.NEGATIVE_INFINITY;
+  let cMax = 0;
+  for (const point of points) {
+    if (Number.isFinite(point.energy)) {
+      eMin = Math.min(eMin, point.energy);
+      eMax = Math.max(eMax, point.energy);
+    }
+    if (Number.isFinite(point.heatCapacity)) cMax = Math.max(cMax, point.heatCapacity);
+  }
+  if (!Number.isFinite(eMin) || !Number.isFinite(eMax)) {
+    eMin = 0;
+    eMax = 1;
+  }
+  if (eMax - eMin < 1e-6) eMax = eMin + 1e-6;
+  if (cMax < 1e-6) cMax = 1;
+  const eSpan = eMax - eMin;
+  const yOfEnergy = (value: number): number => box.bottom - ((value - eMin) / eSpan) * box.plotHeight;
+  const yOfHeat = (value: number): number => box.bottom - (value / cMax) * box.plotHeight;
+
+  // Энергия — основная кривая.
+  ctx.strokeStyle = PLOT_COLORS.temperature;
+  ctx.lineWidth = 1.8;
+  ctx.beginPath();
+  for (let i = 0; i < count; i++) {
+    const x = xOf(i);
+    const y = yOfEnergy(points[i].energy);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Теплоёмкость — второй серией, другим цветом и с заливкой: её пик и есть
+  // отметка перехода.
+  ctx.strokeStyle = PLOT_COLORS.mobile;
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  for (let i = 0; i < count; i++) {
+    const x = xOf(i);
+    const y = yOfHeat(points[i].heatCapacity);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Точки данных: при малом числе температур линия без них читается как
+  // непрерывная зависимость, хотя между точками ничего не измерялось.
+  ctx.fillStyle = PLOT_COLORS.temperature;
+  for (let i = 0; i < count; i++) {
+    ctx.beginPath();
+    ctx.arc(xOf(i), yOfEnergy(points[i].energy), 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  const branchLabel = options.branch === 'cooling' ? 'охлаждение' : 'нагрев';
+  const badge =
+    options.progress !== undefined && options.progress < 1
+      ? `набор ${(options.progress * 100).toFixed(0)} %`
+      : `${points.length} точек · ${branchLabel}`;
+  drawCaption(ctx, box, 'E/N (жёлтая) и C_v/N (зелёная)', PLOT_COLORS.temperature, badge);
+
+  // Подписи оси X — температуры (по индексам), чтобы точки не наезжали.
+  ctx.fillStyle = '#5f7a9a';
+  ctx.font = '10px ui-monospace, monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  const labels = Math.min(5, count);
+  for (let i = 0; i < labels; i++) {
+    const index = Math.round((i / Math.max(1, labels - 1)) * (count - 1));
+    ctx.fillText(points[index].temperature.toFixed(2), xOf(index), cssHeight - 1);
+  }
+  // Подписи оси Y: только концы диапазона энергии.
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(formatTick(eMax), box.left - 5, yOfEnergy(eMax));
+  ctx.fillText(formatTick(eMin), box.left - 5, yOfEnergy(eMin));
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+}
+
+/**
  * Среднеквадратичное смещение MSD(лаг).
  *
  * Кривая читается по наклону: у кристалла она выходит на плато (атомы

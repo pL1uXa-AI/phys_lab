@@ -22,7 +22,7 @@ import {
   type WorldParams,
 } from '../core/types.js';
 import { SceneRenderer } from '../render/scene.js';
-import { drawPlot, drawMsd, drawRadial, drawStructure, PLOT_COLORS } from '../render/plots.js';
+import { drawPlot, drawMsd, drawRadial, drawStructure, drawTransition, PLOT_COLORS } from '../render/plots.js';
 import { InputController } from '../input/controller.js';
 import { unprojectFromScreen, type BrushPlane } from '../core/integrator.js';
 import { AppState, format } from './state.js';
@@ -30,6 +30,7 @@ import { h, need, setContent } from '../ui/dom.js';
 import {
   actionsPanel,
   dataPanel,
+  experimentPanel,
   presetsPanel,
   viewPanel,
   worldPanel,
@@ -40,6 +41,7 @@ import { LevelSession } from '../levels/session.js';
 import { LEVELS, levelNumber, type Level } from '../levels/levels.js';
 import type { LevelReport } from '../levels/checks.js';
 import { parseSnapshot, serializeSnapshot } from '../core/snapshot.js';
+import { PhaseExperiment, type ExperimentConfig } from '../core/experiment.js';
 import {
   canvasToPng,
   downloadDataUrl,
@@ -84,6 +86,11 @@ export class App {
   private lastAutoTune = 0;
   /** Таймер скрытия уведомления. */
   private noticeTimer = 0;
+  /** Идущий эксперимент со свипом по температуре или null. */
+  private experiment: PhaseExperiment | null = null;
+  /** Выбранная ветвь свипа. */
+  private experimentBranch: 'heating' | 'cooling' = 'heating';
+  private experimentPanel: { setProgress(progress: number, phase: string): void } | null = null;
 
   /** Ссылки на панели и их управляющие элементы для синхронизации. */
   private bindings: Partial<ReturnType<typeof worldPanel>['bindings']> = {};
@@ -199,10 +206,13 @@ export class App {
       exitToSandbox: () => this.exitToSandbox(),
     });
 
+    const experimentResult = experimentPanel(actions, () => {});
+    this.experimentPanel = experimentResult;
     sidebar.append(
       worldPanelResult.root,
       actionsPanel(actions),
       presets.root,
+      experimentResult.root,
       viewPanelResult.root,
       dataPanel(actions),
       this.campaign.root,
@@ -410,7 +420,107 @@ export class App {
       exportRadial: () => this.exportRadial(),
       exportStructure: () => this.exportStructure(),
       exportPlot: (which) => this.exportPlot(which),
+      toggleExperiment: () => this.toggleExperiment(),
+      setExperimentBranch: (branch) => this.setExperimentBranch(branch),
     };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Эксперимент: свип по температуре                                    */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Запуск или остановка свипа.
+   *
+   * Свип идёт СВОИМ миром, а не текущим: он должен начинаться с известного
+   * состояния (кристалл для нагрева, газ для охлаждения), иначе результат
+   * зависит от того, что игрок делал до этого, и перестаёт воспроизводиться.
+   * Мир эксперимента подменяет основной на время расчёта.
+   */
+  private toggleExperiment(): void {
+    if (this.experiment) {
+      this.experiment = null;
+      this.state.experimentRunning = false;
+      this.experimentPanel?.setProgress(0, 'остановлен');
+      this.updateExperimentButton();
+      return;
+    }
+
+    this.experiment = new PhaseExperiment({
+      count: Math.min(500, this.world.state.count),
+      density: this.world.params.density,
+      branch: this.experimentBranch,
+    });
+    // Подменяем мир: сцена и графики должны показывать именно его.
+    this.world = this.experiment.simulation;
+    this.state.experimentRunning = true;
+    this.paused = false;
+    this.state.running = true;
+    const runBtn = this.host.querySelector<HTMLButtonElement>('[data-action="run"]');
+    if (runBtn) {
+      runBtn.textContent = 'Пауза';
+      runBtn.classList.add('btn--primary');
+    }
+    // Камера подстраивается под ящик нового мира: у эксперимента он свой,
+    // и без этого сцена окажется в другом масштабе.
+    this.renderer.camera.fit(this.world.box, this.app.renderer.width, this.app.renderer.height);
+    this.updateExperimentButton();
+  }
+
+  /** Смена ветви эксперимента. */
+  private setExperimentBranch(branch: 'heating' | 'cooling'): void {
+    this.experimentBranch = branch;
+    for (const btn of this.host.querySelectorAll<HTMLButtonElement>('[data-branch]')) {
+      btn.classList.toggle('btn--on', btn.dataset['branch'] === branch);
+    }
+    // Перезапуск, если свип уже идёт: смена ветви на ходу дала бы мешанину
+    // из двух разных начальных состояний.
+    if (this.experiment) {
+      this.experiment = null;
+      this.state.experimentRunning = false;
+      this.toggleExperiment();
+    }
+  }
+
+  private updateExperimentButton(): void {
+    const btn = this.host.querySelector<HTMLButtonElement>('[data-action="experiment-toggle"]');
+    if (!btn) return;
+    btn.textContent = this.experiment ? 'Остановить свип' : 'Запустить свип';
+    btn.classList.toggle('btn--primary', Boolean(this.experiment));
+  }
+
+  /**
+   * Шаги эксперимента за кадр.
+   *
+   * Бюджет ограничен временем, а не числом шагов: на 500 частицах шаг дешевле,
+   * но при переключении на модель крупнее картинка не должна дёргаться.
+   */
+  private advanceExperiment(frameStart: number): void {
+    const experiment = this.experiment;
+    if (!experiment || experiment.done) {
+      if (experiment && experiment.done) {
+        this.experimentPanel?.setProgress(1, 'готово');
+        this.updateExperimentButton();
+        this.experiment = null;
+        this.state.experimentRunning = false;
+      }
+      return;
+    }
+    const budgetMs = 12;
+    // Шагаем порциями, проверяя время: `advance` сам разбивает работу, но
+    // точный бюджет известен только по факту.
+    let guard = 0;
+    while (performance.now() - frameStart < budgetMs && guard < 50) {
+      const performed = experiment.advance(200);
+      guard++;
+      if (performed === 0) break;
+      if (performance.now() - frameStart >= budgetMs) break;
+    }
+    const result = experiment.result();
+    const phase = experiment.done
+      ? 'готово'
+      : `T* = ${experiment.currentTemperature.toFixed(2)} · точек ${result.points.length}`;
+    this.experimentPanel?.setProgress(experiment.progress, phase);
   }
 
   /* ------------------------------------------------------------------ */
@@ -735,7 +845,12 @@ export class App {
     const target = 1000 / Math.max(1, this.state.targetFps);
     const elapsed = frameStart - this.lastFrame;
 
-    if (!this.paused && elapsed >= target * 0.6) {
+    if (this.experiment) {
+      // Режим эксперимента: обычная симуляция уступает время свипу.
+      // Физика внутри свипа своя, поэтому `stepsPerFrame` здесь не при чём.
+      this.advanceExperiment(frameStart);
+      this.physicsMs = performance.now() - frameStart;
+    } else if (!this.paused && elapsed >= target * 0.6) {
       this.lastFrame = frameStart;
       const steps = Math.max(1, this.state.stepsPerFrame);
       const physicsStart = performance.now();
@@ -1030,16 +1145,26 @@ export class App {
       peak: this.world.structure.firstPeak(),
     });
 
-    // MSD: по наклону кривой читается диффузия.
-    const msd = this.world.msdCurve();
-    const diffusion = this.world.diffusion();
-    drawMsd(this.plotM, msd.lag, msd.msd, {
-      D: diffusion.D,
-      r2: diffusion.r2,
-      lagRange: diffusion.lagRange,
-      ready: this.world.msdReady,
-      counts: msd.counts,
-    });
+    // MSD: по наклону кривой читается диффузия. Во время эксперимента здесь
+    // показывается кривая перехода — она важнее, а MSD в этом режиме не
+    // накапливается, потому что свип идёт своим миром.
+    if (this.experiment) {
+      const result = this.experiment.result();
+      drawTransition(this.plotM, result.points, {
+        branch: result.branch,
+        progress: this.experiment.progress,
+      });
+    } else {
+      const msd = this.world.msdCurve();
+      const diffusion = this.world.diffusion();
+      drawMsd(this.plotM, msd.lag, msd.msd, {
+        D: diffusion.D,
+        r2: diffusion.r2,
+        lagRange: diffusion.lagRange,
+        ready: this.world.msdReady,
+        counts: msd.counts,
+      });
+    }
   }
 
   private resize(): void {
@@ -1147,6 +1272,38 @@ export class App {
           const { k, s } = this.world.structureFactor();
           return structureToCsv(k, s, this.world.structure.sampleCount);
         },
+        /** Запустить свип по температуре и довести его до конца. */
+        runExperiment: (branch: 'heating' | 'cooling', config?: Partial<ExperimentConfig>) => {
+          const experiment = new PhaseExperiment({
+            count: 256,
+            density: 0.95,
+            temperatures: [0.9, 1.1, 1.2, 1.3, 1.4],
+            equilibrate: 800,
+            sample: 800,
+            sampleEvery: 4,
+            branch,
+            lattice: 'fcc',
+            ...config,
+          });
+          let guard = 0;
+          while (!experiment.done && guard < 2000) {
+            experiment.advance(5000);
+            guard++;
+          }
+          const result = experiment.result();
+          return {
+            done: experiment.done,
+            branch: result.branch,
+            points: result.points.map((point) => ({
+              temperature: point.temperature,
+              energy: point.energy,
+              heatCapacity: point.heatCapacity,
+              measuredTemperature: point.measuredTemperature,
+            })),
+            transitionTemperature: result.transitionTemperature,
+            peakHeatCapacity: result.peakHeatCapacity,
+          };
+        },
       },
       plots: {
         temperature: () => this.plotT,
@@ -1224,6 +1381,22 @@ export interface PhysLabApi {
     radialCsv(): string;
     /** Структурный фактор S(k) в формате CSV. */
     structureCsv(): string;
+    /** Провести свип по температуре и вернуть его результат. */
+    runExperiment(
+      branch: 'heating' | 'cooling',
+      config?: Partial<ExperimentConfig>,
+    ): {
+      done: boolean;
+      branch: string;
+      points: Array<{
+        temperature: number;
+        energy: number;
+        heatCapacity: number;
+        measuredTemperature: number;
+      }>;
+      transitionTemperature: number;
+      peakHeatCapacity: number;
+    };
   };
   plots: {
     temperature(): HTMLCanvasElement;

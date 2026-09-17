@@ -307,6 +307,43 @@ body {
   background: rgba(44, 18, 15, 0.95);
 }
 
+/*
+ * Полоса прогресса длительного расчёта.
+ *
+ * Свип по температуре занимает десятки секунд. Без полосы интерфейс
+ * выглядит зависшим: кнопки нажимаются, а результата нет. Заполнение идёт
+ * по фактическому числу выполненных шагов, а не по таймеру, поэтому
+ * «100 %» означает именно конец расчёта.
+ */
+.progress {
+  position: relative;
+  height: 18px;
+  border-radius: var(--radius);
+  background: #131c28;
+  border: 1px solid #1e2c3d;
+  overflow: hidden;
+}
+
+.progress__fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  background: linear-gradient(90deg, #2c5f7a, #4d8fa8);
+  transition: width 0.2s ease;
+}
+
+.progress__text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
 .plots {
   background: var(--panel);
   border-top: 1px solid var(--line);

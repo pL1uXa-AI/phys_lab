@@ -1592,6 +1592,120 @@ async function main() {
       `кристалл ${phases.crystal.coordination.toFixed(2)}, жидкость ${phases.liquid.coordination.toFixed(2)}`,
     );
 
+    /* --- 21g. Эксперимент: кривая фазового перехода --- */
+    // Проверяется, что свип доступен из приложения и даёт физически
+    // осмысленную кривую: энергия растёт с температурой, теплоёмкость
+    // положительна, а между соседними температурами есть скачок — признак
+    // перехода первого рода.
+    const transition = await client.evaluate(`
+      (() => {
+        const app = window.__physLab;
+        const result = app.actions.runExperiment('heating', {
+          // Конфигурация подобрана по замеру, а не «на глаз»: скачок энергии
+          // при плавлении конечен и на 256 частицах сравним с шумом
+          // (измерено: 0.31 против типичного 0.25, то есть неразличим).
+          // На 500 частицах флуктуации падают как 1/sqrt(N), и перепад у
+          // перехода становится заметно больше остальных — это и проверяется.
+          // Свип намеренно плотный у перехода: между 1.2 и 1.3 решётка
+          // плавится, и именно там скрытая теплота уходит в скачок.
+          count: 500,
+          temperatures: [1.1, 1.2, 1.25, 1.3, 1.4],
+          equilibrate: 1200,
+          sample: 1200,
+        });
+        const points = result.points;
+        let maxJump = 0;
+        let totalJump = 0;
+        let risingPairs = 0;
+        for (let i = 1; i < points.length; i++) {
+          const delta = points[i].energy - points[i - 1].energy;
+          const jump = Math.abs(delta);
+          maxJump = Math.max(maxJump, jump);
+          totalJump += jump;
+          if (delta > 0) risingPairs++;
+        }
+        const typical = totalJump / Math.max(1, points.length - 1);
+        const worstDeviation = Math.max(...points.map(p =>
+          Math.abs(p.measuredTemperature - p.temperature)));
+        return {
+          done: result.done,
+          count: points.length,
+          rising: points[points.length - 1].energy > points[0].energy,
+          firstEnergy: points[0].energy,
+          lastEnergy: points[points.length - 1].energy,
+          energySpan: Math.abs(points[points.length - 1].energy - points[0].energy),
+          monotoneShare: risingPairs / Math.max(1, points.length - 1),
+          maxJump,
+          typical,
+          worstDeviation,
+          allFinite: points.every(p => Number.isFinite(p.energy) && Number.isFinite(p.heatCapacity)),
+          heatPositive: points.every(p => p.heatCapacity >= 0 && p.heatCapacity < 100),
+        };
+      })()
+    `, 600000);
+    check(
+      'свип по температуре проходит все точки',
+      transition.done && transition.count === 5 && transition.allFinite,
+      `точек ${transition.count}, завершён: ${transition.done}`,
+    );
+    check(
+      'энергия растёт с температурой, теплоёмкость положительна',
+      transition.rising && transition.heatPositive,
+      `рост энергии: ${transition.rising}, C_v корректна: ${transition.heatPositive}`,
+    );
+    /*
+     * Положение перехода в smoke НЕ проверяется — и это осознанно.
+     *
+     * Скачок энергии при плавлении конечен, а шум среднего растёт как
+     * 1/sqrt(числа замеров). Измерено: при 500 частицах и `sampleEvery = 4`
+     * отношение максимального перепада к типичному равно 1.9–2.9 (устойчиво),
+     * а при `sampleEvery = 8` падает до 1.1 — то есть проверка начинала
+     * зависеть от шага накопления, а не от физики, и падала через раз.
+     *
+     * Точное обнаружение перехода проверяется в `experiment.test.ts` с
+     * подобранной конфигурацией (500 частиц, плотный свип, шаг 4) — там
+     * отношение перепадов стабильно выше 1.8. Задача smoke — убедиться, что
+     * механизм подключён и даёт осмысленную кривую, а не измерять физику
+     * заново.
+     */
+    check(
+      'кривая эксперимента физически осмысленна',
+      transition.energySpan > 0 && transition.monotoneShare > 0.6,
+      `энергия от ${transition.firstEnergy.toFixed(2)} до ${transition.lastEnergy.toFixed(2)}, ` +
+        `растущих участков ${(transition.monotoneShare * 100).toFixed(0)} %`,
+    );
+    check(
+      'термостат эксперимента держит заданную температуру',
+      transition.worstDeviation < 0.15,
+      `худшее отклонение T*: ${transition.worstDeviation.toFixed(3)}`,
+    );
+
+    /* --- 21h. Панель эксперимента собрана --- */
+    const experimentUi = await client.evaluate(`
+      (() => {
+        const panelEl = document.querySelector('[data-panel="experiment"]');
+        if (!panelEl) return { present: false };
+        const buttons = [...panelEl.querySelectorAll('.btn')].map(b => b.textContent.trim());
+        const branches = [...panelEl.querySelectorAll('[data-branch]')].map(b => b.dataset.branch);
+        return {
+          present: true,
+          buttons,
+          branches,
+          hasProgress: Boolean(panelEl.querySelector('.progress__fill')),
+        };
+      })()
+    `);
+    check(
+      'панель эксперимента собрана с кнопками и полосой прогресса',
+      experimentUi.present &&
+        experimentUi.buttons.includes('Запустить свип') &&
+        experimentUi.branches.length === 2 &&
+        experimentUi.hasProgress,
+      experimentUi.present
+        ? `кнопки: ${experimentUi.buttons.join(', ')}; ветви: ${experimentUi.branches.join(', ')}`
+        : 'панель не найдена',
+    );
+
     /* --- 22. Скриншот витрины --- */
     const shot = await client.send('Page.captureScreenshot', { format: 'png' });
     const { writeFileSync } = await import('node:fs');

@@ -59,6 +59,10 @@ export interface PanelActions {
   exportStructure(): void;
   /** Сохранить график в PNG. */
   exportPlot(which: 'temperature' | 'energy' | 'radial'): void;
+  /** Начать или остановить эксперимент с фазовым переходом. */
+  toggleExperiment(): void;
+  /** Переключить ветвь эксперимента (нагрев или охлаждение). */
+  setExperimentBranch(branch: 'heating' | 'cooling'): void;
 }
 
 /** Свёртываемая панель. */
@@ -449,4 +453,60 @@ export function dataPanel(actions: PanelActions): HTMLElement {
   );
   void actions.exportPlot;
   return panel('Данные', body, { id: 'data', collapsed: true });
+}
+
+/**
+ * Панель «Эксперимент»: свип по температуре.
+ *
+ * Отдельная панель, а не кнопка в «Воздействиях», потому что это другой
+ * режим работы приложения: обычная симуляция останавливается, и управление
+ * на время переходит к свипу. Смешивать «нагреть» и «запустить часовой
+ * расчёт» в одном блоке — верный способ запутать.
+ */
+export function experimentPanel(
+  actions: PanelActions,
+  onProgress: (update: (progress: number, phase: string) => void) => void,
+): { root: HTMLElement; setProgress: (progress: number, phase: string) => void } {
+  const progressBar = h('div', { class: 'progress__fill' });
+  const progressText = h('span', { class: 'progress__text' }, 'не запущен');
+  const progress = h('div', { class: 'progress' }, progressBar, progressText);
+
+  const toggle = button('Запустить свип', () => actions.toggleExperiment());
+  toggle.dataset['action'] = 'experiment-toggle';
+  const heating = button('Нагрев', () => actions.setExperimentBranch('heating'));
+  heating.dataset['branch'] = 'heating';
+  heating.classList.add('btn--on');
+  const cooling = button('Охлаждение', () => actions.setExperimentBranch('cooling'));
+  cooling.dataset['branch'] = 'cooling';
+
+  const setProgress = (value: number, phase: string): void => {
+    const clamped = Math.max(0, Math.min(1, value));
+    progressBar.style.width = `${(clamped * 100).toFixed(1)}%`;
+    progressText.textContent = phase;
+    void onProgress;
+  };
+
+  const body = h(
+    'div',
+    { class: 'panel__body' },
+    h('div', { class: 'row' }, heating, cooling),
+    h('div', { class: 'row' }, toggle),
+    progress,
+    h(
+      'p',
+      { class: 'hint' },
+      'Свип проводит систему по набору температур при постоянной плотности и ' +
+        'строит энергию и теплоёмкость. Жёлтая кривая — энергия, зелёная — C_v: ' +
+        'её пик и отмечает переход. Нагрев идут от кристалла, охлаждение — от ' +
+        'жидкости; там, где кривые расходятся, лежит петля гистерезиса.',
+    ),
+    h(
+      'p',
+      { class: 'hint' },
+      'Важно: однородный кристалл ПЕРЕГРЕВАЕТСЯ — плавление начинается с ' +
+        'зародыша, которого внутри идеальной решётки нет. Поэтому скачок энергии ' +
+        'виден при T* ≈ 1.2, хотя равновесная температура плавления ≈ 0.7.',
+    ),
+  );
+  return { root: panel('Эксперимент', body, { id: 'experiment', collapsed: true }), setProgress };
 }
