@@ -26,8 +26,26 @@ import type { SegmentBuffer } from './trails.js';
 
 /** Длина текстуры отрезка в пикселях. */
 const TEXTURE_LENGTH = 64;
-/** Толщина текстуры отрезка в пикселях. */
-const TEXTURE_THICKNESS = 4;
+
+/**
+ * Толщина текстуры отрезка в пикселях.
+ *
+ * ─── Почему текстура такая толстая ───────────────────────────────────────
+ *
+ * Первая версия имела толщину 4 px с мягкими краями: градиент занимал
+ * ПОЛОВИНУ толщины (от 0 до 0.25 и от 0.75 до 1). При растягивании по
+ * вертикали мягкая зона растягивалась вместе с линией, и связи выглядели
+ * размытыми полосами — именно это и было видно на кадрах.
+ *
+ * Теперь толщина 16 px, а непрозрачная сердцевина занимает 14 из них:
+ * мягкий край — ровно один пиксель текстуры с каждой стороны. При сжатии
+ * до реальной толщины линии в 1–2 px сглаживание получается ровно на
+ * пиксель, то есть линия остаётся резкой, но без ступенек.
+ */
+const TEXTURE_THICKNESS = 16;
+
+/** Ширина мягкого края текстуры (в пикселях текстуры). */
+const TEXTURE_EDGE = 1;
 
 /**
  * Потолок числа отрезков в одном слое.
@@ -165,11 +183,12 @@ export class LineLayer {
 }
 
 /**
- * Текстура отрезка: вытянутый прямоугольник с мягкими краями.
+ * Текстура отрезка: вытянутый прямоугольник с узкой мягкой кромкой.
  *
  * Центр текстуры совпадает с центром отрезка — поэтому привязка 0.5 и
- * поворот вокруг середины работают как надо. Мягкие края по вертикали
- * убирают ступеньки на стыках линий с частицами.
+ * поворот вокруг середины работают как надо. Мягкая кромка шириной в один
+ * пиксель убирает ступеньки на стыках, но не превращает линию в размытую
+ * полосу: раньше градиент занимал половину толщины, и связи «плыли».
  */
 export function makeSegmentTexture(length = TEXTURE_LENGTH, thickness = TEXTURE_THICKNESS): Texture {
   const canvas = document.createElement('canvas');
@@ -177,10 +196,12 @@ export function makeSegmentTexture(length = TEXTURE_LENGTH, thickness = TEXTURE_
   canvas.height = thickness;
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('Не удалось получить 2D-контекст для текстуры отрезка');
+  const edge = Math.min(TEXTURE_EDGE, Math.floor(thickness / 2) - 1);
   const gradient = ctx.createLinearGradient(0, 0, 0, thickness);
+  // Непрозрачная сердцевина и по одному пикселю затухания с каждой стороны.
   gradient.addColorStop(0, 'rgba(255,255,255,0)');
-  gradient.addColorStop(0.25, 'rgba(255,255,255,1)');
-  gradient.addColorStop(0.75, 'rgba(255,255,255,1)');
+  gradient.addColorStop(edge / thickness, 'rgba(255,255,255,1)');
+  gradient.addColorStop(1 - edge / thickness, 'rgba(255,255,255,1)');
   gradient.addColorStop(1, 'rgba(255,255,255,0)');
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, length, thickness);

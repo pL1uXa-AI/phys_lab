@@ -1113,6 +1113,40 @@ export class App {
           const curve = this.world.msdCurve();
           return { lag: Array.from(curve.lag), msd: Array.from(curve.msd) };
         },
+        /**
+         * Снимок мира как JSON-строка — для сквозных проверок.
+         *
+         * Настоящее сохранение идёт через скачивание файла, а его в headless
+         * браузере не перехватить. Здесь тот же самый код сериализации, так
+         * что проверяется он, а не «похожий».
+         */
+        snapshotJson: () => serializeSnapshot(this.world.snapshot()),
+        /** Загрузить состояние из JSON-строки. Возвращает текст ошибки или null. */
+        restoreJson: (text: string) => {
+          const parsed = parseSnapshot(text);
+          if (!parsed.ok) return parsed.error;
+          this.world.restore(parsed.loaded);
+          this.afterRebuild();
+          return null;
+        },
+        /** CSV-тексты для проверки формата. */
+        historyCsv: () => {
+          const history = this.world.history;
+          const rows: HistoryRow[] = [];
+          for (let i = 0; i < history.size; i++) {
+            const sample = history.get(i);
+            if (sample) rows.push({ ...sample });
+          }
+          return historyToCsv(rows);
+        },
+        radialCsv: () => {
+          const { r, g } = this.world.radialDistribution();
+          return radialToCsv(r, g, this.world.radial.sampleCount);
+        },
+        structureCsv: () => {
+          const { k, s } = this.world.structureFactor();
+          return structureToCsv(k, s, this.world.structure.sampleCount);
+        },
       },
       plots: {
         temperature: () => this.plotT,
@@ -1180,6 +1214,16 @@ export interface PhysLabApi {
     setShowBonds(value: boolean): void;
     /** Кривая MSD (лаг и смещение) — для проверок. */
     msdCsv(): { lag: number[]; msd: number[] };
+    /** Сериализованный снимок мира (JSON-строка). */
+    snapshotJson(): string;
+    /** Восстановить мир из JSON; возвращает текст ошибки или null при успехе. */
+    restoreJson(text: string): string | null;
+    /** История измерений в формате CSV. */
+    historyCsv(): string;
+    /** Радиальная функция g(r) в формате CSV. */
+    radialCsv(): string;
+    /** Структурный фактор S(k) в формате CSV. */
+    structureCsv(): string;
   };
   plots: {
     temperature(): HTMLCanvasElement;

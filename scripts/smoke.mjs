@@ -1401,7 +1401,198 @@ async function main() {
         `отношение ${radialIntegrity.ratio.toFixed(4)}`,
     );
 
-    /* --- 21. Скриншот витрины --- */
+    /* --- 21. Сохранение состояния: круговорот «сохранить → загрузить» --- */
+    // Главное требование к сохранению — не «данные не потерялись», а что
+    // восстановленный мир продолжает ТУ ЖЕ траекторию. Проверяется буквально:
+    // снимок, восстановление в тот же мир, прогон и сравнение координат.
+    // Термостат Ланжевена намеренно: он потребляет случайные числа, поэтому
+    // без сохранения состояния генератора траектория разошлась бы.
+    const saveLoad = await client.evaluate(`
+      (() => {
+        const app = window.__physLab;
+        app.actions.applyPreset('liquid');
+        app.actions.setThermostat('langevin');
+        app.actions.runSteps(60);
+
+        const json = app.actions.snapshotJson();
+        const before = { steps: app.metrics().steps, time: app.metrics().time };
+        const error = app.actions.restoreJson(json);
+
+        // Продолжаем оба «мира» нельзя (мир один), поэтому проверяем иначе:
+        // после загрузки состояние обязано совпасть с сохранённым, а
+        // следующий прогон — дать те же координаты, что дал бы до загрузки.
+        const afterRestore = { steps: app.metrics().steps, time: app.metrics().time };
+        return {
+          error,
+          bytes: json.length,
+          stepsMatch: before.steps === afterRestore.steps,
+          timeMatch: Math.abs(before.time - afterRestore.time) < 1e-12,
+        };
+      })()
+    `, 300000);
+    check(
+      'состояние сохраняется и загружается без ошибок',
+      saveLoad.error === null && saveLoad.bytes > 1000,
+      saveLoad.error ? `ошибка: ${saveLoad.error}` : `снимок ${saveLoad.bytes} байт`,
+    );
+    check(
+      'после загрузки время и число шагов восстановлены',
+      saveLoad.stepsMatch && saveLoad.timeMatch,
+      `шаги совпали: ${saveLoad.stepsMatch}, время совпало: ${saveLoad.timeMatch}`,
+    );
+
+    /* --- 21b. Детерминизм: восстановленный мир идёт той же траекторией --- */
+    const determinism = await client.evaluate(`
+      (() => {
+        const app = window.__physLab;
+        app.actions.applyPreset('liquid');
+        app.actions.setThermostat('langevin');
+        app.actions.runSteps(80);
+
+        const json = app.actions.snapshotJson();
+        app.actions.runSteps(60);
+        const original = Array.from(app.world.state.x.slice(0, 40));
+
+        app.actions.restoreJson(json);
+        app.actions.runSteps(60);
+        const restored = Array.from(app.world.state.x.slice(0, 40));
+
+        let maxDiff = 0;
+        for (let i = 0; i < original.length; i++) {
+          maxDiff = Math.max(maxDiff, Math.abs(original[i] - restored[i]));
+        }
+        return { maxDiff };
+      })()
+    `, 300000);
+    check(
+      'восстановленный мир продолжает ту же траекторию',
+      determinism.maxDiff < 1e-9,
+      `максимальное расхождение координат: ${determinism.maxDiff.toExponential(2)}`,
+    );
+
+    /* --- 21c. Битый файл отвергается с причиной --- */
+    const badFile = await client.evaluate(`
+      (() => {
+        const app = window.__physLab;
+        const notJson = app.actions.restoreJson('{ это не json');
+        const wrongVersion = app.actions.restoreJson(JSON.stringify({ version: 999, params: {}, state: {} }));
+        return { notJson, wrongVersion };
+      })()
+    `, 120000);
+    check(
+      'битый файл отвергается с внятной причиной',
+      typeof badFile.notJson === 'string' && badFile.notJson.length > 0 &&
+        typeof badFile.wrongVersion === 'string' && badFile.wrongVersion.length > 0,
+      `не-JSON: «${badFile.notJson}», чужая версия: «${badFile.wrongVersion}»`,
+    );
+
+    /* --- 21d. Экспорт CSV: формат пригоден для внешней программы --- */
+    const csv = await client.evaluate(`
+      (() => {
+        const app = window.__physLab;
+        app.actions.applyPreset('liquid');
+        app.actions.runSteps(80);
+        for (let i = 0; i < 8; i++) app.world.sampleRadial();
+
+        const history = app.actions.historyCsv();
+        const radial = app.actions.radialCsv();
+        const structure = app.actions.structureCsv();
+        const lines = (text) => text.trimEnd().split('\\n');
+        const header = (text) => lines(text)[0].split(';');
+        return {
+          historyRows: lines(history).length,
+          historyHeader: header(history),
+          radialRows: lines(radial).length,
+          radialHeader: header(radial),
+          structureHeader: header(structure),
+          // Проверяем, что в файле нет NaN и что разделитель именно «;».
+          hasNaN: history.includes('NaN') || radial.includes('NaN') || structure.includes('NaN'),
+          rowsConsistent: lines(radial).every(l => l.split(';').length === 3),
+        };
+      })()
+    `, 300000);
+    check(
+      'история выгружается в CSV с заголовком и данными',
+      csv.historyRows > 3 && csv.historyHeader[0] === 'время_tau' && csv.historyHeader.includes('T*'),
+      `строк ${csv.historyRows}, столбцов ${csv.historyHeader.length}`,
+    );
+    check(
+      'g(r) и S(k) выгружаются с ожидаемыми столбцами',
+      csv.radialHeader[0] === 'r_sigma' && csv.structureHeader[0] === 'k_sigma^-1' && csv.rowsConsistent,
+      `g(r): ${csv.radialHeader.join(', ')}; S(k): ${csv.structureHeader.join(', ')}`,
+    );
+    check(
+      'в выгрузке нет NaN',
+      csv.hasNaN === false,
+      csv.hasNaN ? 'найден NaN' : 'чисто',
+    );
+
+    /* --- 21e. Новые графики действительно рисуются --- */
+    const extraPlots = await client.evaluate(`
+      (() => {
+        const app = window.__physLab;
+        const inkOf = (canvas) => {
+          if (!canvas) return 0;
+          const ctx = canvas.getContext('2d');
+          const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+          let ink = 0;
+          for (let i = 3; i < data.length; i += 4) if (data[i] > 0) ink++;
+          return ink;
+        };
+        return {
+          structure: inkOf(app.plots.structure()),
+          msd: inkOf(app.plots.msd()),
+        };
+      })()
+    `, 120000);
+    check(
+      'график S(k) нарисован',
+      extraPlots.structure > 500,
+      `закрашенных пикселей: ${extraPlots.structure}`,
+    );
+    check(
+      'график MSD нарисован',
+      extraPlots.msd > 500,
+      `закрашенных пикселей: ${extraPlots.msd}`,
+    );
+
+    /* --- 21f. D и S(k) различают фазы количественно --- */
+    // Прогон намеренно короткий: проверяется НЕ точность D (для неё нужны
+    // тысячи шагов и это уже сделано в юнит-тестах), а что величины вообще
+    // доступны из приложения и различают фазы в правильную сторону.
+    const phases = await client.evaluate(`
+      (() => {
+        const app = window.__physLab;
+        const measure = (preset) => {
+          app.actions.applyPreset(preset);
+          app.actions.runSteps(200);
+          for (let i = 0; i < 12; i++) {
+            app.actions.runSteps(20);
+            app.world.sampleRadial();
+          }
+          const peak = app.world.structure.firstPeak();
+          return {
+            sPeak: peak.height,
+            coordination: app.metrics().coordination,
+          };
+        };
+        const crystal = measure('crystal');
+        const liquid = measure('liquid');
+        return { crystal, liquid };
+      })()
+    `, 300000);
+    check(
+      'S(k) кристалла резко выше, чем у жидкости',
+      phases.crystal.sPeak > phases.liquid.sPeak * 3,
+      `кристалл ${phases.crystal.sPeak.toFixed(1)}, жидкость ${phases.liquid.sPeak.toFixed(1)}`,
+    );
+    check(
+      'координационное число кристалла выше, чем у жидкости',
+      phases.crystal.coordination > phases.liquid.coordination + 1,
+      `кристалл ${phases.crystal.coordination.toFixed(2)}, жидкость ${phases.liquid.coordination.toFixed(2)}`,
+    );
+
+    /* --- 22. Скриншот витрины --- */
     const shot = await client.send('Page.captureScreenshot', { format: 'png' });
     const { writeFileSync } = await import('node:fs');
     writeFileSync(resolve(SHOT_DIR, 'smoke.png'), Buffer.from(shot.data, 'base64'));

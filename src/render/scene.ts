@@ -50,6 +50,15 @@ const DRAW_LIMIT = 40000;
 /** Радиус кружка в текстуре (пиксели). */
 const TEXTURE_SIZE = 32;
 
+/**
+ * Диаметр нарисованного диска внутри текстуры.
+ *
+ * Круг занимает сторону холста минус один пиксель: этот запас нужен, чтобы
+ * мягкий край диска не обрезался прямоугольником текстуры и не появлялось
+ * квадратных «уголков» у крупных частиц.
+ */
+const CIRCLE_DIAMETER = TEXTURE_SIZE - 1;
+
 /** Цвет векторов скоростей. */
 const VECTOR_COLOR = '#e8d9a0';
 
@@ -191,20 +200,23 @@ export class SceneRenderer {
     const color = world.colorValues(this.options.colorMode);
 
     const halfDiagonal = world.box * 1.1;
-    /**
+    /*
      * Радиус частицы в единицах σ.
      *
-     * Раньше он выводился из объёма, приходящегося на частицу, и на плотном
-     * кристалле получался ~0.38σ — почти вплотную к половине межатомного
-     * расстояния. Сферы сливались в сплошное пятно, и решётку было не видно.
+     * ─── Почему именно 0.21σ ─────────────────────────────────────────────
      *
-     * Теперь радиус — фиксированная доля σ, независимая от числа частиц:
-     * при ρ* = 0.95 соседние атомы стоят на 1.02σ, и радиус 0.3σ оставляет
-     * между ними просвет. Именно так кристалл читается как решётка, а не
-     * как каша. Для разрежённого газа частицы при этом выглядят мелкими —
-     * это правильно, они и физически далеко друг от друга.
+     * При ρ* = 0.95 соседние атомы стоят на 1.02σ друг от друга. Радиус
+     * 0.21σ даёт диаметр 0.42σ, то есть 41 % межатомного расстояния: между
+     * сферами остаётся больше половины просвета, и решётка читается как
+     * решётка. Прежние 0.30σ давали 59 % — кружки почти соприкасались, и
+     * структура сливалась в пятно, особенно в глубине, где сферы
+     * накладываются вдоль луча зрения.
+     *
+     * Радиус намеренно НЕ зависит от числа частиц: он привязан к σ, то есть
+     * к физическому размеру атома. Для разрежённого газа частицы поэтому
+     * выглядят мелкими — это правильно, они и физически далеко друг от друга.
      */
-    const radiusBase = 0.3;
+    const radiusBase = 0.21;
     const scale = this.camera.scale * this.options.particleScale;
 
     let drawn = 0;
@@ -223,7 +235,7 @@ export class SceneRenderer {
       }
       const screen = this.camera.worldToScreen(px, py);
       const depth = depthFactor(pz, world.box);
-      const diameter = radiusBase * scale * depth;
+      const diameter = radiusBase * 2 * scale * depth;
 
       // Частица меньше половины пикселя превращается в шум: рисуем её
       // прозрачной, а не мигающей точкой.
@@ -233,8 +245,21 @@ export class SceneRenderer {
       }
       sprite.x = screen.x;
       sprite.y = screen.y;
-      // Текстура кружка имеет диаметр TEXTURE_SIZE пикселей.
-      const factor = (diameter * 2) / TEXTURE_SIZE;
+      /*
+       * Масштаб спрайта.
+       *
+       * В текстуре круг занимает ровно `CIRCLE_DIAMETER` пикселей (на пиксель
+       * меньше стороны холста — запас нужен, чтобы мягкий край диска не
+       * обрезался прямоугольником текстуры). Множитель переводит желаемый
+       * диаметр в сигме в пиксели текстуры: `diameter / CIRCLE_DIAMETER`.
+       *
+       * Раньше здесь стояло `diameter * 2 / TEXTURE_SIZE`, что при
+       * `diameter = radius * scale` давало тот же самый результат: удвоение
+       * компенсировало то, что `radiusBase` — радиус, а не диаметр. Формула
+       * была верна, но читалась как ошибка, поэтому переменная теперь
+       * называется `diameter` и множитель двойки стоит при её вычислении.
+       */
+      const factor = diameter / CIRCLE_DIAMETER;
       sprite.scaleX = factor;
       sprite.scaleY = factor;
       /*
@@ -289,9 +314,25 @@ export class SceneRenderer {
     return this.camera.worldToScreen(rx, ry);
   }
 
-  /** Текущий масштаб и толщина линий — общие для всех слоёв. */
+  /**
+   * Толщина линий слоя в пикселях.
+   *
+   * ─── Почему она почти не зависит от масштаба ─────────────────────────────
+   *
+   * Раньше формула была `base · scale · 0.12` — то есть толщина росла вместе
+   * с зумом. При масштабе 40 px/σ это давало 5–7 px: связи превращались в
+   * толстые полосы и забивали сами атомы, а шлейфы выглядели размытыми
+   * лентами. Толщина линии — свойство ЭКРАНА, а не мира: при увеличении
+   * должна расти длина отрезка, а не его толщина.
+   *
+   * Оставлена очень слабая зависимость (четвёртый корень от масштаба): на
+   * сильно увеличенной картинке линия в один пиксель выглядела бы нитью,
+   * теряющейся между крупными атомами.
+   */
   private lineThickness(base: number): number {
-    return Math.max(1, base * this.camera.scale * 0.12 * this.options.particleScale);
+    const zoom = Math.max(0.5, this.camera.scale) / 40;
+    const adapted = base * Math.pow(zoom, 0.25);
+    return Math.max(0.75, adapted * this.options.particleScale);
   }
 
   /**
@@ -365,8 +406,10 @@ export class SceneRenderer {
 
     const drawn = this.bondLayer.draw(buffer, {
       color: BOND_COLOR,
-      thickness: this.lineThickness(1.6),
-      alpha: 0.9,
+      // Связь тоньше атома: атомы должны читаться как УЗЛЫ решётки, а не
+      // тонуть в линиях.
+      thickness: this.lineThickness(1.4),
+      alpha: 0.85,
       project: (px, py, pz) => this.projectWorld(world, px, py, pz),
     });
     this.bondStats = { drawn, truncated: net.truncated || net.pairCount > MAX_SEGMENTS };
@@ -386,7 +429,7 @@ export class SceneRenderer {
     this.trailLayer.draw(clean, {
       color: TRAIL_COLOR,
       thickness: this.lineThickness(1.2),
-      alpha: 0.5,
+      alpha: 0.45,
       project: (px, py, pz) => this.projectWorld(world, px, py, pz),
     });
   }
