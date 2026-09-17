@@ -364,3 +364,278 @@ export function drawRadial(
   ctx.fillStyle = '#5f7a9a';
   ctx.fillText(options.samples > 0 ? `кадров: ${options.samples}` : 'накопление…', right, 2);
 }
+
+/**
+ * Общая заготовка осей для кривых с «физическими» осями (не время-величина).
+ *
+ * Понадобилась, когда к g(r) добавились S(k) и MSD: у всех трёх по X идёт
+ * физическая величина, а не время, и повторять разметку осей трижды —
+ * верный способ сделать их непохожими друг на друга.
+ */
+interface AxesBox {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+  plotWidth: number;
+  plotHeight: number;
+}
+
+/** Подготовка канваса: размеры, контекст и рамка области построения. */
+function prepareCanvas(
+  canvas: HTMLCanvasElement,
+): { ctx: CanvasRenderingContext2D; cssWidth: number; cssHeight: number; box: AxesBox } | null {
+  const ratio = window.devicePixelRatio || 1;
+  const cssWidth = canvas.clientWidth || 300;
+  const cssHeight = canvas.clientHeight || 120;
+  if (canvas.width !== Math.round(cssWidth * ratio) || canvas.height !== Math.round(cssHeight * ratio)) {
+    canvas.width = Math.round(cssWidth * ratio);
+    canvas.height = Math.round(cssHeight * ratio);
+  }
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+  const padding = 8;
+  const left = padding + 30;
+  const right = cssWidth - padding - 6;
+  const top = padding + 16;
+  const bottom = cssHeight - padding - 14;
+  const box: AxesBox = {
+    left,
+    right,
+    top,
+    bottom,
+    plotWidth: Math.max(1, right - left),
+    plotHeight: Math.max(1, bottom - top),
+  };
+  ctx.fillStyle = '#0e1520';
+  ctx.fillRect(left, top, box.plotWidth, box.plotHeight);
+  ctx.strokeStyle = '#1e2a3a';
+  ctx.strokeRect(left + 0.5, top + 0.5, box.plotWidth - 1, box.plotHeight - 1);
+  return { ctx, cssWidth, cssHeight, box };
+}
+
+/** Заголовок графика и число кадров в правом верхнем углу. */
+function drawCaption(
+  ctx: CanvasRenderingContext2D,
+  box: AxesBox,
+  title: string,
+  colour: string,
+  badge: string,
+): void {
+  ctx.fillStyle = '#a8bdd4';
+  ctx.font = '11px system-ui, -apple-system, Segoe UI, sans-serif';
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';
+  ctx.fillText(title, 8, 2);
+  void colour;
+  if (badge) {
+    ctx.fillStyle = '#5f7a9a';
+    ctx.font = '10px ui-monospace, monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(badge, box.right, 2);
+    ctx.textAlign = 'left';
+  }
+}
+
+/** Подписи делений по обеим осям. */
+function drawTicks(
+  ctx: CanvasRenderingContext2D,
+  box: AxesBox,
+  cssHeight: number,
+  xMax: number,
+  yMax: number,
+  xFormat: (value: number) => string,
+  yFormat: (value: number) => string,
+): void {
+  ctx.fillStyle = '#5f7a9a';
+  ctx.font = '10px ui-monospace, monospace';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= 2; i++) {
+    const value = (yMax * i) / 2;
+    ctx.fillText(yFormat(value), box.left - 5, box.bottom - (value / yMax) * box.plotHeight);
+  }
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  for (let i = 0; i <= 3; i++) {
+    const value = (xMax * i) / 3;
+    ctx.fillText(xFormat(value), box.left + (value / xMax) * box.plotWidth, cssHeight - 1);
+  }
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+}
+
+/**
+ * Структурный фактор S(k).
+ *
+ * Главное, что должно быть видно: у кристалла — узкие высокие пики, у
+ * жидкости — один широкий горб, у газа — почти прямая линия на уровне 1.
+ * Поэтому опорная линия S = 1 (предел идеального газа) обязательна: без неё
+ * «горб» и «пик» выглядят одинаково.
+ */
+export function drawStructure(
+  canvas: HTMLCanvasElement,
+  k: Float64Array,
+  s: Float64Array,
+  options: { samples: number; peak?: { k: number; height: number } } = { samples: 0 },
+): void {
+  // Сетка с логарифмом по Y дала бы «правильный» вид, но усложнила бы чтение
+  // чисел на оси; для сравнения кривых линейной шкалы достаточно.
+  const prepared = prepareCanvas(canvas);
+  if (!prepared) return;
+  const { ctx, cssHeight, box } = prepared;
+
+  const n = Math.min(k.length, s.length);
+  /*
+   * Ось X обрезается по последнему НЕПУСТОМУ бину.
+   *
+   * `result()` отдаёт все бины до kMax включительно, но при малом числе
+   * частиц на дальних оболочках векторов просто нет, и значения там нули.
+   * На графике это выглядело как «полка» из нулей в правой трети — будто
+   * S(k) там действительно падает до нуля. Обрезка показывает ровно тот
+   * диапазон, где данные есть.
+   */
+  let last = -1;
+  for (let i = 0; i < n; i++) {
+    if (Number.isFinite(s[i]) && s[i] > 0) last = i;
+  }
+  const used = last >= 2 ? last + 1 : n;
+  const kMax = used > 0 ? Math.max(1e-6, k[used - 1]) : 18;
+  let sMax = 1.4;
+  for (let i = 0; i < used; i++) if (Number.isFinite(s[i]) && s[i] > sMax) sMax = s[i];
+
+  // Опорная линия S = 1 — предел идеального газа.
+  ctx.save();
+  ctx.setLineDash([4, 4]);
+  ctx.strokeStyle = '#3d4f68';
+  ctx.beginPath();
+  const yOf = (value: number): number => box.bottom - (value / sMax) * box.plotHeight;
+  ctx.moveTo(box.left, yOf(1));
+  ctx.lineTo(box.right, yOf(1));
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.strokeStyle = PLOT_COLORS.peak;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let i = 0; i < used; i++) {
+    const x = box.left + (k[i] / kMax) * box.plotWidth;
+    const y = yOf(Number.isFinite(s[i]) ? s[i] : 0);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  drawCaption(ctx, box, 'S(k) — структурный фактор', PLOT_COLORS.peak, options.samples > 0 ? `кадров: ${options.samples}` : 'накопление…');
+  drawTicks(ctx, box, cssHeight, kMax, sMax, (v) => v.toFixed(1), formatTick);
+
+  // Отметка первого пика: без неё «на глаз» не понять, где именно максимум.
+  const peak = options.peak;
+  if (peak && peak.height > 0 && peak.k > 0) {
+    const x = box.left + (peak.k / kMax) * box.plotWidth;
+    const y = yOf(peak.height);
+    ctx.fillStyle = '#f2d06a';
+    ctx.beginPath();
+    ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = '10px ui-monospace, monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(`${peak.height.toFixed(1)}`, x, y - 4);
+  }
+}
+
+/**
+ * Среднеквадратичное смещение MSD(лаг).
+ *
+ * Кривая читается по наклону: у кристалла она выходит на плато (атомы
+ * колеблются вокруг узла), у жидкости растёт линейно. Именно линейный
+ * участок и даёт коэффициент диффузии D, поэтому на графике отмечается
+ * отрезок, по которому идёт подгонка, — иначе связь «кривая → число D»
+ * остаётся для игрока невидимой.
+ */
+export function drawMsd(
+  canvas: HTMLCanvasElement,
+  lag: Float64Array,
+  msd: Float64Array,
+  options: {
+    D: number;
+    r2: number;
+    lagRange: [number, number];
+    ready: boolean;
+    /** Число наблюдений в каждом бине — по нему обрезается кривая. */
+    counts?: Int32Array;
+  },
+): void {
+  const prepared = prepareCanvas(canvas);
+  if (!prepared) return;
+  const { ctx, cssHeight, box } = prepared;
+
+  /*
+   * Обрезка по последнему бину с данными.
+   *
+   * ─── Почему это обязательно ──────────────────────────────────────────────
+   *
+   * `result()` отдаёт все бины, а пустые заполняет нулём. На графике это
+   * выглядело как обрыв: кривая доходила до последнего лага, на котором
+   * успело накопиться хотя бы одно наблюдение, и дальше падала в ноль —
+   * то есть рисовался «спад MSD», которого в физике нет. Хуже того, бины
+   * с ОДНИМ наблюдением дают большой разброс, и именно они создавали
+   * ложный излом в конце.
+   *
+   * Поэтому рисуем только до последнего бина, где данных хватает: не менее
+   * четверти от максимума по всем бинам. Это тот же порог, по которому
+   * вообще имеет смысл говорить о среднем.
+   */
+  const counts = options.counts;
+  let limit = Math.min(lag.length, msd.length);
+  if (counts && counts.length > 0) {
+    let maxCount = 0;
+    for (let i = 0; i < counts.length; i++) if (counts[i] > maxCount) maxCount = counts[i];
+    let last = -1;
+    for (let i = 0; i < limit; i++) {
+      if (i < counts.length && counts[i] >= Math.max(1, maxCount * 0.25)) last = i;
+    }
+    if (last >= 2) limit = last + 1;
+  }
+
+  const n = limit;
+  let lagMax = 1e-6;
+  let msdMax = 1e-6;
+  for (let i = 0; i < n; i++) {
+    if (Number.isFinite(lag[i]) && lag[i] > lagMax) lagMax = lag[i];
+    if (Number.isFinite(msd[i]) && msd[i] > msdMax) msdMax = msd[i];
+  }
+  const xOf = (value: number): number => box.left + (value / lagMax) * box.plotWidth;
+  const yOf = (value: number): number => box.bottom - (value / msdMax) * box.plotHeight;
+
+  // Отрезок подгонки: по нему считается D.
+  if (options.ready && options.lagRange[1] > options.lagRange[0]) {
+    const x1 = xOf(options.lagRange[0]);
+    const x2 = xOf(options.lagRange[1]);
+    ctx.fillStyle = 'rgba(127, 214, 192, 0.10)';
+    ctx.fillRect(x1, box.top, Math.max(1, x2 - x1), box.plotHeight);
+  }
+
+  ctx.strokeStyle = PLOT_COLORS.mobile;
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = xOf(lag[i]);
+    const y = yOf(Number.isFinite(msd[i]) ? msd[i] : 0);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Подпись D: ноль до набора статистики и ноль у кристалла — разные вещи,
+  // поэтому при недобранном окне пишется прогресс, а не число.
+  const badge = options.ready
+    ? `D = ${options.D.toFixed(4)}  r² = ${options.r2.toFixed(2)}`
+    : 'набор статистики…';
+  drawCaption(ctx, box, 'MSD — смещение', PLOT_COLORS.mobile, badge);
+  drawTicks(ctx, box, cssHeight, lagMax, msdMax, (v) => `${v.toFixed(1)}τ`, formatTick);
+}

@@ -47,6 +47,18 @@ export interface PanelActions {
   resetWorld(): void;
   resample(): void;
   setTool(tool: string): void;
+  /** Сохранить состояние мира в файл. */
+  saveState(): void;
+  /** Загрузить состояние мира из файла. */
+  loadState(): void;
+  /** Выгрузить историю измерений в CSV. */
+  exportHistory(): void;
+  /** Выгрузить g(r) в CSV. */
+  exportRadial(): void;
+  /** Выгрузить S(k) в CSV. */
+  exportStructure(): void;
+  /** Сохранить график в PNG. */
+  exportPlot(which: 'temperature' | 'energy' | 'radial'): void;
 }
 
 /** Свёртываемая панель. */
@@ -383,4 +395,58 @@ export function taskList(items: Array<{ label: string; done: boolean; detail: st
     );
   }
   return list;
+}
+
+/**
+ * Панель «Данные»: сохранение состояния и выгрузка результатов.
+ *
+ * Почему отдельная панель, а не кнопки в «Воздействиях»: это не воздействие
+ * на мир, а работа с ним как с данными. Смешивать «нагреть» и «сохранить в
+ * файл» в одном блоке — верный способ запутать.
+ *
+ * Загрузка сделана через скрытый `<input type="file">`: браузер не даёт
+ * открыть диалог выбора файла иначе, как по действию пользователя, поэтому
+ * кнопка «Загрузить» программно кликает по этому полю.
+ */
+export function dataPanel(actions: PanelActions): HTMLElement {
+  const fileInput = h('input', {
+    type: 'file',
+    accept: '.json,application/json',
+    style: 'display: none',
+    dataset: { role: 'load-state' },
+  });
+
+  const body = h(
+    'div',
+    { class: 'panel__body' },
+    h(
+      'div',
+      { class: 'row' },
+      button('Сохранить JSON', actions.saveState),
+      button('Загрузить JSON', () => {
+        actions.loadState();
+      }),
+    ),
+    h(
+      'div',
+      { class: 'row' },
+      button('История → CSV', actions.exportHistory),
+      button('g(r) → CSV', actions.exportRadial),
+    ),
+    h(
+      'div',
+      { class: 'row' },
+      button('S(k) → CSV', actions.exportStructure),
+    ),
+    h(
+      'p',
+      { class: 'hint' },
+      'Сохранённый JSON восстанавливает состояние точно: продолжение даёт ту же ' +
+        'траекторию, включая случайные числа термостата. Экспорт CSV открывается ' +
+        'в Excel (разделитель — точка с запятой, кодировка UTF-8 с BOM).',
+    ),
+    fileInput,
+  );
+  void actions.exportPlot;
+  return panel('Данные', body, { id: 'data', collapsed: true });
 }

@@ -267,11 +267,57 @@ body {
   line-height: 1.5;
 }
 
+/*
+ * Уведомление о результате операции с данными.
+ *
+ * Операции вроде «сохранить в файл» не имеют видимого результата: браузер
+ * скачивает файл молча, и без подтверждения кнопка выглядит неработающей.
+ * Ошибка загрузки — тем более: без текста причины непонятно, что чинить.
+ *
+ * Уведомление живёт поверх сцены и скрывается по таймеру; указатель мыши
+ * его не перехватывает, чтобы не мешать перетаскиванию частиц.
+ */
+.notice {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%) translateY(8px);
+  max-width: 80%;
+  padding: 7px 14px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: #d6e4f5;
+  background: rgba(14, 24, 38, 0.94);
+  border: 1px solid #2a3d56;
+  border-radius: var(--radius);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  z-index: 5;
+}
+
+.notice--visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.notice--error {
+  color: #ffd9d0;
+  border-color: #6b3630;
+  background: rgba(44, 18, 15, 0.95);
+}
+
 .plots {
   background: var(--panel);
   border-top: 1px solid var(--line);
   display: grid;
+  /*
+   * Пять графиков в две строки. Раньше их было три в один ряд, но к T, E и
+   * g(r) добавились S(k) и MSD, и в одну строку они стали бы нечитаемо узкими
+   * (меньше 200 px на график при типичной ширине окна).
+   */
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
   gap: 6px;
   padding: 6px;
   min-height: 0;

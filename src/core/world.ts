@@ -51,8 +51,19 @@ import {
 } from './initializers.js';
 import { aliveCount, kineticEnergyOfState } from './velocity.js';
 import { measure, RadialDistribution, type Measurement } from './measure.js';
+import { StructureFactor, type StructureCurve } from './structure.js';
+import {
+  MeanSquareDisplacement,
+  type DiffusionResult,
+  type MsdCurve,
+} from './diffusion.js';
 import { ljShift, type LjShift } from './potential.js';
 import { Rng } from './rng.js';
+import {
+  snapshotWorld,
+  type LoadedSnapshot,
+  type WorldSnapshot,
+} from './snapshot.js';
 import {
   boxLength,
   DEFAULT_PARAMS,
@@ -79,6 +90,15 @@ export interface Sample {
 
 /** Ёмкость кольцевого буфера графиков: при dt = 0.004 это ≈ 16 τ. */
 const HISTORY_CAPACITY = 4096;
+
+/**
+ * Сколько кадров статистики между началами отсчёта MSD.
+ *
+ * Берётся 4: при типичном интервале g(r) в 40 шагов это начало каждые
+ * ~160 шагов. За минуту набирается порядка сотни начал — достаточно, чтобы
+ * оценка D перестала «дрожать» между запусками.
+ */
+const MSD_ORIGIN_INTERVAL = 4;
 
 /**
  * Кольцевой буфер замеров.
@@ -240,6 +260,28 @@ export class World {
   readonly radial = new RadialDistribution(3.5, 140);
 
   /**
+   * Структурный фактор S(k).
+   *
+   * Отличает кристалл от жидкости резче, чем g(r): пики S(k) у твёрдого
+   * тела узкие и высокие, у жидкости — один широкий горб. Считается на
+   * том же кадре статистики, что и g(r).
+   */
+  readonly structure = new StructureFactor(18, 90);
+
+  /**
+   * Среднеквадратичное смещение и коэффициент диффузии D.
+   *
+   * Это величина, которая КОЛИЧЕСТВЕННО отличает кристалл от жидкости:
+   * у кристалла D ≈ 0, у жидкости — порядка 0.1. «Подвижных 0 %» из сводки
+   * отвечает на вопрос «есть ли движение», а D — «насколько быстро»,
+   * и именно её сравнивают с экспериментом.
+   *
+   * Начала отсчёта добавляются периодически: оценка MSD по одному началу
+   * шумная, а по десяткам — устойчивая (см. `MeanSquareDisplacement`).
+   */
+  readonly msd = new MeanSquareDisplacement(40, 10);
+
+  /**
    * Сеть связей ближних соседей — то, из чего рисуется «структура».
    *
    * Строится ЛЕНИВО: только когда её кто-то спросит (рендер при включённом
@@ -250,6 +292,16 @@ export class World {
   readonly bonds = new BondNetwork();
   /** Изменились ли координаты с последнего построения сети связей. */
   private bondsStale = true;
+  /**
+   * Счётчик кадров до следующего начала отсчёта MSD.
+   *
+   * Одно начало даёт смещение «от момента сохранения» и потому шумную
+   * оценку: она зависит от того, в какой фазе колебаний атомы были в этот
+   * момент. Несколько десятков начал усредняют эту случайность.
+   */
+  private originCounter = 0;
+  /** Счётчик кадров до следующего расчёта S(k) — см. `structureEvery`. */
+  private structureCounter = 0;
 
   /** Накопленное время симуляции в единицах τ. */
   time = 0;
@@ -645,15 +697,114 @@ export class World {
   }
 
   /**
-   * Кадр статистики для g(r).
+   * Кадр статистики для g(r) и структурного фактора S(k).
    *
    * Гистограмма строится по той же сетке, что и силы, поэтому стоимость
-   * линейна по числу частиц. Вызывается приложением раз в несколько шагов:
-   * чаще не нужно, кривая накапливается десятками кадров.
+   * линейна по числу частиц. S(k) считается прямым суммированием по всем
+   * векторам k, то есть линейно по N на каждый вектор. Вызывается
+   * приложением раз в несколько шагов: чаще не нужно, обе кривые
+   * накапливаются десятками кадров.
    */
   sampleRadial(): void {
     this.radial.accumulate(this.state, this.box, this.params.boundary === 'periodic');
     this.lastPeak = this.radial.firstPeak(this.box);
+
+    /*
+     * Структурный фактор считается НЕ каждый кадр статистики.
+     *
+     * Прямое суммирование S(k) стоит O(N · число векторов k), а число
+     * векторов растёт как L³ ~ N, то есть суммарно это O(N²). На 20 000
+     * частиц один расчёт занимает около 80 мс — столько же, сколько все
+     * остальные кадры статистики вместе.
+     *
+     * Поэтому при больших системах S(k) накапливается реже (см.
+     * `structureEvery`): кривая «зреет» дольше, но кадр остаётся дешёвым.
+     * Разрешение по k при этом НЕ снижается — в отличие от прореживания
+     * векторов, реже считать значит просто меньше усреднять.
+     */
+    this.structureCounter++;
+    if (this.structureCounter >= this.structureEvery) {
+      this.structureCounter = 0;
+      this.structure.accumulate(this.state, this.box);
+    }
+
+    // Диффузия накапливается на том же кадре статистики. Начало отсчёта
+    // добавляется не каждый раз, а с интервалом: соседние начала почти
+    // дублируют друг друга и не улучшают оценку, а память занимают.
+    this.msd.sample(this.state, this.box, this.params.boundary === 'periodic', this.time);
+    this.originCounter++;
+    if (this.originCounter >= MSD_ORIGIN_INTERVAL) {
+      this.originCounter = 0;
+      this.msd.addOrigin(this.state, this.box);
+    }
+  }
+
+  /**
+   * Через сколько кадров статистики считать S(k).
+   *
+   * Порог по числу частиц выбран по замеру: до 4000 частиц расчёт укладывается
+   * в единицы миллисекунд и его можно делать каждый кадр; выше стоимость
+   * растёт квадратично, и интервал увеличивается пропорционально.
+   */
+  private get structureEvery(): number {
+    const count = this.state.count;
+    if (count <= 4000) return 1;
+    return Math.max(1, Math.min(8, Math.round(count / 4000)));
+  }
+
+  /** Готовая кривая среднеквадратичного смещения. */
+  msdCurve(): MsdCurve {
+    return this.msd.result();
+  }
+
+  /** Коэффициент самодиффузии D с качеством подгонки. */
+  diffusion(): DiffusionResult {
+    return this.msd.diffusion();
+  }
+
+  /**
+   * Набрано ли достаточно статистики, чтобы D что-то значила.
+   *
+   * Без этой проверки интерфейс показывал бы «D = 0» и у кристалла, и у
+   * только что запущенной жидкости: окно наблюдения (maxLag) заполняется
+   * за тысячи шагов, а до тех пор подгонка идёт по пустым бинам и честно
+   * возвращает ноль. Отличить «атомы стоят» от «данных ещё нет» по одному
+   * числу невозможно — поэтому признак готовности считается отдельно.
+   *
+   * Порог 60 % окна: меньшего заполнения мало для устойчивого наклона,
+   * а ждать полного окна пришлось бы заметно дольше без выигрыша в точности.
+   */
+  get msdReady(): boolean {
+    const curve = this.msdCurve();
+    const counts = curve.counts;
+    let deepest = -1;
+    for (let k = counts.length - 1; k >= 0; k--) {
+      if (counts[k] > 0) {
+        deepest = k;
+        break;
+      }
+    }
+    if (deepest < 0) return false;
+    return deepest >= Math.floor(0.6 * (counts.length - 1));
+  }
+
+  /** Доля заполнения окна MSD — для индикатора набора статистики. */
+  get msdProgress(): number {
+    const counts = this.msdCurve().counts;
+    let deepest = 0;
+    for (let k = counts.length - 1; k >= 0; k--) {
+      if (counts[k] > 0) {
+        deepest = k;
+        break;
+      }
+    }
+    const span = Math.max(1, counts.length - 1);
+    return Math.min(1, deepest / span);
+  }
+
+  /** Готовая кривая структурного фактора S(k). */
+  structureFactor(): StructureCurve {
+    return this.structure.result();
   }
 
   /**
@@ -769,6 +920,9 @@ export class World {
     this.lastPeak = 0;
     this.history.clear();
     this.radial.reset();
+    this.structure.reset();
+    this.msd.reset();
+    this.originCounter = 0;
     this.bondsStale = true;
   }
 
@@ -1048,6 +1202,58 @@ export class World {
   get coordination(): number {
     const net = this.bondNetwork();
     return net.meanCoordination(this.state);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Сохранение и загрузка                                               */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Снимок состояния для сохранения в файл.
+   *
+   * Сохраняется не только «физика» (координаты и скорости), но и всё, что
+   * нужно для продолжения ТОЙ ЖЕ траектории: состояние генератора случайных
+   * чисел (иначе термостат Ланжевена пойдёт другим путём), опорные
+   * координаты решётки, накопленный путь и смещение, маска заморозки,
+   * счётчики времени и шагов.
+   */
+  snapshot(): WorldSnapshot {
+    return snapshotWorld(this);
+  }
+
+  /**
+   * Восстановление мира из снимка.
+   *
+   * Мир пересобирается целиком: меняется число частиц, а значит и все
+   * рабочие буферы (сетка, список соседей, сетка связей, g(r)).
+   */
+  restore(loaded: LoadedSnapshot): void {
+    this.params = { ...loaded.params };
+    this.state = loaded.state;
+    this.frozen = new Uint8Array(loaded.frozen);
+    this.box = loaded.box;
+    this.time = loaded.time;
+    this.steps = loaded.steps;
+    this.rng.restore(loaded.rng);
+
+    this.shift = ljShift(this.params.cutoff);
+    this.grid = this.makeGrid();
+    this.verlet.resize(this.state.count);
+    this.radial.prepare(this.state.count, this.box);
+    this.radial.reset();
+    this.structure.reset();
+    this.msd.reset();
+    this.originCounter = 0;
+    this.history.clear();
+    this.pendingPoke = null;
+    this.pendingRebuild = null;
+    this.bondsStale = true;
+    this.axisCache = null;
+    this.recoveredFromNaN = 0;
+
+    this.rebuildForces();
+    this.current = this.measureNow();
+    this.history.push(this.makeSample());
   }
 
   /**

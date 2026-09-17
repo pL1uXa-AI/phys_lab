@@ -22,16 +22,34 @@ import {
   type WorldParams,
 } from '../core/types.js';
 import { SceneRenderer } from '../render/scene.js';
-import { drawPlot, drawRadial, PLOT_COLORS } from '../render/plots.js';
+import { drawPlot, drawMsd, drawRadial, drawStructure, PLOT_COLORS } from '../render/plots.js';
 import { InputController } from '../input/controller.js';
 import { unprojectFromScreen, type BrushPlane } from '../core/integrator.js';
 import { AppState, format } from './state.js';
 import { h, need, setContent } from '../ui/dom.js';
-import { actionsPanel, presetsPanel, viewPanel, worldPanel, type PanelActions } from '../ui/panels.js';
+import {
+  actionsPanel,
+  dataPanel,
+  presetsPanel,
+  viewPanel,
+  worldPanel,
+  type PanelActions,
+} from '../ui/panels.js';
 import { CampaignPanel, openHelp } from '../ui/campaign.js';
 import { LevelSession } from '../levels/session.js';
 import { LEVELS, levelNumber, type Level } from '../levels/levels.js';
 import type { LevelReport } from '../levels/checks.js';
+import { parseSnapshot, serializeSnapshot } from '../core/snapshot.js';
+import {
+  canvasToPng,
+  downloadDataUrl,
+  downloadText,
+  historyToCsv,
+  radialToCsv,
+  structureToCsv,
+  timestampedName,
+  type HistoryRow,
+} from '../render/export.js';
 
 /**
  * Сколько шагов между кадрами статистики g(r).
@@ -64,6 +82,8 @@ export class App {
   private drawMs = 0;
   private physicsMs = 0;
   private lastAutoTune = 0;
+  /** Таймер скрытия уведомления. */
+  private noticeTimer = 0;
 
   /** Ссылки на панели и их управляющие элементы для синхронизации. */
   private bindings: Partial<ReturnType<typeof worldPanel>['bindings']> = {};
@@ -73,6 +93,8 @@ export class App {
   private plotT!: HTMLCanvasElement;
   private plotE!: HTMLCanvasElement;
   private plotR!: HTMLCanvasElement;
+  private plotS!: HTMLCanvasElement;
+  private plotM!: HTMLCanvasElement;
   private legendMin: HTMLElement | null = null;
   private legendMax: HTMLElement | null = null;
   private presetHighlight: (id: string | null) => void = () => {};
@@ -130,10 +152,14 @@ export class App {
     this.plotT = h('canvas', {});
     this.plotE = h('canvas', {});
     this.plotR = h('canvas', {});
+    this.plotS = h('canvas', {});
+    this.plotM = h('canvas', {});
     plots.append(
       h('div', { class: 'plot' }, this.plotT),
       h('div', { class: 'plot' }, this.plotE),
       h('div', { class: 'plot' }, this.plotR),
+      h('div', { class: 'plot' }, this.plotS),
+      h('div', { class: 'plot' }, this.plotM),
     );
 
     const topbar = this.buildTopbar();
@@ -178,8 +204,20 @@ export class App {
       actionsPanel(actions),
       presets.root,
       viewPanelResult.root,
+      dataPanel(actions),
       this.campaign.root,
     );
+
+    // Скрытое поле выбора файла: браузер открывает диалог только по действию
+    // пользователя, поэтому кнопка «Загрузить JSON» кликает по нему.
+    const loadInput = sidebar.querySelector<HTMLInputElement>('[data-role="load-state"]');
+    loadInput?.addEventListener('change', () => {
+      const file = loadInput.files?.[0];
+      if (file) void this.loadStateFile(file);
+      // Сбрасываем значение: иначе повторный выбор ТОГО ЖЕ файла не вызовет
+      // событие `change`, и загрузка «не сработает» второй раз.
+      loadInput.value = '';
+    });
     this.bindings = { ...worldPanelResult.bindings, ...viewPanelResult.bindings };
     // Подписи концов легенды: без чисел цвет частицы не связать с физикой.
     this.legendMin = viewPanelResult.root.querySelector('[data-legend="min"]');
@@ -366,7 +404,141 @@ export class App {
       setTool: (tool) => {
         this.input.tool = tool as 'poke';
       },
+      saveState: () => this.saveState(),
+      loadState: () => this.openLoadDialog(),
+      exportHistory: () => this.exportHistory(),
+      exportRadial: () => this.exportRadial(),
+      exportStructure: () => this.exportStructure(),
+      exportPlot: (which) => this.exportPlot(which),
     };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Данные: сохранение, загрузка, экспорт                               */
+  /* ------------------------------------------------------------------ */
+
+  /** Сохранить состояние мира в JSON-файл. */
+  private saveState(): void {
+    const text = serializeSnapshot(this.world.snapshot());
+    downloadText(timestampedName('phys-lab-состояние', 'json'), text, 'application/json;charset=utf-8');
+  }
+
+  /** Открыть диалог выбора файла состояния. */
+  private openLoadDialog(): void {
+    const input = this.host.querySelector<HTMLInputElement>('[data-role="load-state"]');
+    input?.click();
+  }
+
+  /**
+   * Загрузка состояния из выбранного файла.
+   *
+   * Ошибки показываются игроку, а не глотаются: «файл не загрузился» без
+   * причины — худший вариант, потому что непонятно, что чинить.
+   */
+  private async loadStateFile(file: File): Promise<void> {
+    try {
+      const text = await file.text();
+      const parsed = parseSnapshot(text);
+      if (!parsed.ok) {
+        this.showNotice(`Не удалось загрузить: ${parsed.error}`, true);
+        return;
+      }
+      this.world.restore(parsed.loaded);
+      this.session = null;
+      this.state.levelId = null;
+      this.campaign.showSandbox();
+      this.paused = true;
+      this.state.running = false;
+      const btn = this.host.querySelector<HTMLButtonElement>('[data-action="run"]');
+      if (btn) {
+        btn.textContent = 'Пуск';
+        btn.classList.remove('btn--primary');
+      }
+      this.afterRebuild();
+      this.showNotice(`Состояние загружено: ${format.int(this.world.state.count)} частиц, τ = ${format.time(this.world.time)}`);
+    } catch (error) {
+      this.showNotice(`Не удалось прочитать файл: ${(error as Error).message}`, true);
+    }
+  }
+
+  /** Выгрузить историю измерений в CSV. */
+  private exportHistory(): void {
+    const history = this.world.history;
+    const rows: HistoryRow[] = [];
+    for (let i = 0; i < history.size; i++) {
+      const sample = history.get(i);
+      if (!sample) continue;
+      rows.push({
+        time: sample.time,
+        temperature: sample.temperature,
+        kinetic: sample.kinetic,
+        potential: sample.potential,
+        total: sample.total,
+        pressure: sample.pressure,
+        orderPeak: sample.orderPeak,
+        mobileFraction: sample.mobileFraction,
+      });
+    }
+    if (rows.length === 0) {
+      this.showNotice('История пуста — нечего выгружать', true);
+      return;
+    }
+    downloadText(timestampedName('phys-lab-история', 'csv'), historyToCsv(rows));
+    this.showNotice(`Выгружено строк: ${rows.length}`);
+  }
+
+  /** Выгрузить g(r) в CSV. */
+  private exportRadial(): void {
+    const { r, g } = this.world.radialDistribution();
+    const samples = this.world.radial.sampleCount;
+    if (samples === 0) {
+      this.showNotice('Статистика g(r) ещё не накоплена', true);
+      return;
+    }
+    downloadText(timestampedName('phys-lab-gr', 'csv'), radialToCsv(r, g, samples));
+    this.showNotice(`g(r) выгружена, кадров: ${samples}`);
+  }
+
+  /** Выгрузить S(k) в CSV. */
+  private exportStructure(): void {
+    const { k, s } = this.world.structureFactor();
+    const samples = this.world.structure.sampleCount;
+    if (samples === 0) {
+      this.showNotice('Структурный фактор ещё не накоплен', true);
+      return;
+    }
+    downloadText(timestampedName('phys-lab-sk', 'csv'), structureToCsv(k, s, samples));
+    this.showNotice(`S(k) выгружен, кадров: ${samples}`);
+  }
+
+  /** Сохранить график в PNG. */
+  private exportPlot(which: 'temperature' | 'energy' | 'radial'): void {
+    const canvas =
+      which === 'temperature' ? this.plotT : which === 'energy' ? this.plotE : this.plotR;
+    downloadDataUrl(timestampedName(`phys-lab-${which}`, 'png'), canvasToPng(canvas));
+  }
+
+  /**
+   * Краткое уведомление в углу сцены.
+   *
+   * Нужно для операций, у которых нет видимого результата: сохранение файла
+   * или неудачная загрузка иначе выглядят как «кнопка ничего не делает».
+   */
+  private showNotice(message: string, isError = false): void {
+    let node = this.host.querySelector<HTMLElement>('[data-role="notice"]');
+    if (!node) {
+      node = h('div', { class: 'notice', dataset: { role: 'notice' } });
+      // Уведомление живёт ВНУТРИ сцены: так оно позиционируется относительно
+      // неё и не перекрывает графики и панели.
+      this.stage.append(node);
+    }
+    node.textContent = message;
+    node.classList.toggle('notice--error', isError);
+    node.classList.add('notice--visible');
+    window.clearTimeout(this.noticeTimer);
+    this.noticeTimer = window.setTimeout(() => {
+      node?.classList.remove('notice--visible');
+    }, 4000);
   }
 
   /* ------------------------------------------------------------------ */
@@ -698,6 +870,7 @@ export class App {
     // Сеть связей строится лениво и кэшируется до следующего шага физики,
     // поэтому её можно спросить и здесь: лишнего обхода пар не будет.
     const bonds = this.world.bondNetwork();
+    const diffusion = this.world.diffusion();
     const rows: Array<[string, string]> = [
       ['частиц', format.int(m.count)],
       ['T*', format.value(m.temperature)],
@@ -708,7 +881,9 @@ export class App {
       ['P*', format.value(m.pressure, 2)],
       ['связей/атом', format.value(bonds.meanCoordination(this.world.state), 2)],
       ['разброс связей', format.value(bonds.lengthSpread(), 3)],
+      ['D (диффузия)', this.diffusionLabel(diffusion.D)],
       ['пик g(r)', format.value(this.world.orderPeak, 2)],
+      ['пик S(k)', format.value(this.world.structure.firstPeak().height, 2)],
       ['время τ', format.time(this.world.time)],
       ['пар', format.int(this.world.pairCount)],
       ['кадров g(r)', format.int(this.world.radial.sampleCount)],
@@ -730,6 +905,20 @@ export class App {
         `${format.int(m.count)} частиц  ·  P* = ${format.value(m.pressure, 2)}` +
         this.equilibriumLabel();
     }
+  }
+
+  /**
+   * Подпись коэффициента диффузии.
+   *
+   * Ноль до набора статистики и ноль у настоящего кристалла — разные вещи,
+   * и показывать их одинаково нельзя: игрок решит, что жидкость застыла.
+   * Поэтому при недобранном окне выводится прогресс набора, а не число.
+   */
+  private diffusionLabel(value: number): string {
+    if (!this.world.msdReady) {
+      return `набор ${(this.world.msdProgress * 100).toFixed(0)} %`;
+    }
+    return format.value(value, 4);
   }
 
   /**
@@ -832,6 +1021,25 @@ export class App {
 
     const { r, g } = this.world.radialDistribution();
     drawRadial(this.plotR, r, g, { samples: this.world.radial.sampleCount });
+
+    // Структурный фактор: у кристалла узкие пики, у жидкости широкий горб —
+    // это самое наглядное отличие фаз на графике.
+    const structure = this.world.structureFactor();
+    drawStructure(this.plotS, structure.k, structure.s, {
+      samples: this.world.structure.sampleCount,
+      peak: this.world.structure.firstPeak(),
+    });
+
+    // MSD: по наклону кривой читается диффузия.
+    const msd = this.world.msdCurve();
+    const diffusion = this.world.diffusion();
+    drawMsd(this.plotM, msd.lag, msd.msd, {
+      D: diffusion.D,
+      r2: diffusion.r2,
+      lagRange: diffusion.lagRange,
+      ready: this.world.msdReady,
+      counts: msd.counts,
+    });
   }
 
   private resize(): void {
@@ -901,11 +1109,17 @@ export class App {
           this.state.view.showBonds = value;
           this.renderer.options.showBonds = value;
         },
+        msdCsv: () => {
+          const curve = this.world.msdCurve();
+          return { lag: Array.from(curve.lag), msd: Array.from(curve.msd) };
+        },
       },
       plots: {
         temperature: () => this.plotT,
         energy: () => this.plotE,
         radial: () => this.plotR,
+        structure: () => this.plotS,
+        msd: () => this.plotM,
       },
       levels: () =>
         LEVELS.map((level) => ({
@@ -928,6 +1142,11 @@ export class App {
         bondPairs: this.world.bondNetwork().pairCount,
         bondSpread: this.world.bondNetwork().lengthSpread(),
         bondsDrawn: this.renderer.bondStatsSnapshot.drawn,
+        diffusion: this.world.diffusion().D,
+        diffusionR2: this.world.diffusion().r2,
+        msdOrigins: this.world.msd.originCount,
+        structurePeak: this.world.structure.firstPeak().height,
+        structurePeakK: this.world.structure.firstPeak().k,
       }),
       boxLength: (count: number, density: number) => boxLength(count, density),
     };
@@ -959,11 +1178,17 @@ export interface PhysLabApi {
     setBondRadius(value: number): void;
     /** Включить или выключить слой связей. */
     setShowBonds(value: boolean): void;
+    /** Кривая MSD (лаг и смещение) — для проверок. */
+    msdCsv(): { lag: number[]; msd: number[] };
   };
   plots: {
     temperature(): HTMLCanvasElement;
     energy(): HTMLCanvasElement;
     radial(): HTMLCanvasElement;
+    /** График структурного фактора S(k). */
+    structure(): HTMLCanvasElement;
+    /** График среднеквадратичного смещения MSD. */
+    msd(): HTMLCanvasElement;
   };
   levels(): Array<{ id: string; number: number; title: string; checks: number }>;
   metrics(): {
@@ -984,6 +1209,16 @@ export interface PhysLabApi {
     bondSpread: number;
     /** Сколько связей реально нарисовано в последнем кадре. */
     bondsDrawn: number;
+    /** Коэффициент самодиффузии D из MSD. */
+    diffusion: number;
+    /** Качество линейной подгонки MSD (коэффициент детерминации). */
+    diffusionR2: number;
+    /** Сколько начал отсчёта накоплено для MSD. */
+    msdOrigins: number;
+    /** Высота первого пика S(k). */
+    structurePeak: number;
+    /** Волновое число первого пика S(k). */
+    structurePeakK: number;
   };
   boxLength(count: number, density: number): number;
 }
