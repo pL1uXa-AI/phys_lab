@@ -2,11 +2,11 @@
  * Витринные кадры и проверка визуальных состояний.
  *
  * Запуск: node scripts/showcase.mjs
- * Требует запущенного предпросмотра (`npm run preview`).
+ * Требует запущенного предпросмотра (npm run preview).
  *
  * Зачем это отдельно от сквозной проверки. Смоук отвечает на вопрос «работает
  * ли», а здесь мы смотрим, как это ВЫГЛЯДИТ: снимаем кадры каждого пресета
- * в спокойном состоянии и сохраняем в `docs/images/`. Кадры попадают в README,
+ * в спокойном состоянии и сохраняем в docs/images/. Кадры попадают в README,
  * поэтому их вид — часть результата, а не побочный продукт.
  *
  * Скрипт падает с ненулевым кодом, если какая-то сцена оказалась пустой
@@ -337,20 +337,142 @@ async function main() {
       );
     }
 
-    // Отдельный кадр с интерфейсом целиком — для README нужен и он.
-    await client.eval(`
-      (() => {
+    /*
+     * Главный витринный кадр — он идёт в README первым.
+     *
+     * Поставлен намеренно, а не «как получилось»: нужно, чтобы в одном кадре
+     * читалось ВСЁ, что проект умеет показывать, иначе читатель снова увидит
+     * «куб с частицами» и не поймёт, в чём разница с десятком других демок.
+     *
+     * Что настраивается и почему:
+     *  - ПЛАВЛЕНИЕ, а не кристалл: на этом пресете одновременно виден
+     *    ближний порядок (решётка ещё держится, связи читаются) и его
+     *    разрушение — то есть самое интересное состояние системы;
+     *  - камера ближе (зум), иначе решётка превращается в мелкую сетку;
+     *  - связи и шлейфы включены, векторы выключены: векторы на статичном
+     *    кадре выглядят случайными штрихами и забивают структуру;
+     *  - статистика накоплена заранее, чтобы S(k) и MSD были не пустыми:
+     *    пустой график в README хуже, чем его отсутствие;
+     *  - панели «Вид» и «Мир» раскрыты, остальные свёрнуты: видно названия
+     *    новых переключателей, но сцена не задавлена интерфейсом.
+     */
+    const heroInfo = await client.eval(`
+      (async () => {
+        const app = window.__physLab;
         for (const p of document.querySelectorAll('.panel')) p.classList.remove('panel--collapsed');
-        window.__physLab.actions.applyPreset('melting');
-        window.__physLab.actions.runSteps(600);
+        // Сворачиваем то, что не нужно на кадре.
+        for (const name of ['world', 'actions', 'presets', 'campaign', 'data', 'experiment']) {
+          const panel = document.querySelector('[data-panel="' + name + '"]');
+          if (panel) panel.classList.add('panel--collapsed');
+        }
+        const view = document.querySelector('[data-panel="view"]');
+        if (view) view.classList.remove('panel--collapsed');
+
+        app.actions.applyPreset('melting');
+        app.actions.runSteps(400);
+        /*
+         * Накопление статистики — умеренное.
+         *
+         * Первая версия делала 70 итераций по 20 шагов, и витринный прогон
+         * переставал укладываться в лимит: в headless-режиме софтверный
+         * WebGL считает каждый кадр в десятки раз медленнее видеокарты, а
+         * S(k) и MSD накапливаются на тех же кадрах.
+         *
+         * 55 итераций по 20 шагов (1100 шагов = 4.4 tau) подобраны по замеру:
+         * окно MSD заполняется настолько, чтобы в сводке стояло ГОТОВОЕ
+         * значение D, а не «набор 38 %». Пустое место в графике выглядит
+         * недоделкой на кадре, который идёт в README первым.
+         */
+        for (let i = 0; i < 55; i++) {
+          app.actions.runSteps(20);
+          app.world.sampleRadial();
+        }
+        /*
+         * Лёгкое приближение вместо сильного.
+         *
+         * Первая версия кадра делала 4 шага по 1.15 — это 1.75×, и ящик
+         * вылезал за края кадра, а частицы снова выглядели крупными (ровно
+         * та претензия, из-за которой размер и уменьшали). Двух шагов по
+         * 1.06 (1.12×) достаточно, чтобы решётка читалась, но сцена
+         * осталась целиком.
+         */
+        /*
+         * Размеры канваса берутся у САМОГО канваса.
+         *
+         * Здесь была ошибка, из-за которой главный витринный кадр вышел
+         * пустым: вызывался app.renderer.width, но у SceneRenderer такого
+         * свойства нет — оно лежит глубже (renderer.app.renderer). В
+         * camera.fit уходили undefined, масштаб становился NaN, и сцена
+         * исчезала. Проверка «файл создан» этого не ловила: файл
+         * действительно создавался — просто пустой.
+         */
+        const canvas = document.querySelector('.stage canvas');
+        const w = canvas ? canvas.clientWidth : 1200;
+        const h = canvas ? canvas.clientHeight : 600;
+        app.camera.fit(app.world.box, w, h);
+        for (let i = 0; i < 2; i++) app.camera.zoomAt(w / 2, h / 2, 1.06);
+        if (app.state.running) app.actions.toggleRun();
+        app.renderer.render(app.world);
+        await new Promise((r) => requestAnimationFrame(r));
         document.querySelector('.sidebar').scrollTop = 0;
+        const m = app.metrics();
+        return { drawn: app.renderer.drawnCount, count: m.count, peak: m.orderPeak };
       })()
-    `);
-    await delay(1200);
+    `, 600000);
+    // Проверяем НЕ факт создания файла, а что на кадре действительно есть
+    // сцена: пустой PNG — это уже случалось и выглядело как «файл создан».
+    check(
+      'главный витринный кадр не пуст',
+      heroInfo.drawn > 200 && heroInfo.count > 0,
+      `нарисовано ${heroInfo.drawn} из ${heroInfo.count}`,
+    );
+    await delay(1500);
     const full = await client.send('Page.captureScreenshot', { format: 'png' });
     writeFileSync(resolve(OUT_DIR, 'interface.png'), Buffer.from(full.data, 'base64'));
-    console.log(`        ${OUT_DIR}/interface.png — интерфейс целиком`);
+    console.log(`        ${OUT_DIR}/interface.png — главный витринный кадр`);
     check('кадр интерфейса снят', existsSync(resolve(OUT_DIR, 'interface.png')));
+
+    // Отдельный широкий кадр сцены без интерфейса: для README нужен и он.
+    const latticeInfo = await client.eval(`
+      (async () => {
+        const app = window.__physLab;
+        app.actions.applyPreset('crystal');
+        app.actions.runSteps(350);
+        for (let i = 0; i < 45; i++) {
+          app.actions.runSteps(20);
+          app.world.sampleRadial();
+        }
+        /*
+         * Размеры канваса берутся у САМОГО канваса.
+         *
+         * Здесь была ошибка, из-за которой главный витринный кадр вышел
+         * пустым: вызывался app.renderer.width, но у SceneRenderer такого
+         * свойства нет — оно лежит глубже (renderer.app.renderer). В
+         * camera.fit уходили undefined, масштаб становился NaN, и сцена
+         * исчезала. Проверка «файл создан» этого не ловила: файл
+         * действительно создавался — просто пустой.
+         */
+        const canvas = document.querySelector('.stage canvas');
+        const w = canvas ? canvas.clientWidth : 1200;
+        const h = canvas ? canvas.clientHeight : 600;
+        app.camera.fit(app.world.box, w, h);
+        for (let i = 0; i < 2; i++) app.camera.zoomAt(w / 2, h / 2, 1.06);
+        if (app.state.running) app.actions.toggleRun();
+        app.renderer.render(app.world);
+        await new Promise((r) => requestAnimationFrame(r));
+        const m = app.metrics();
+        return { drawn: app.renderer.drawnCount, count: m.count };
+      })()
+    `, 600000);
+    check(
+      'кадр решётки не пуст',
+      latticeInfo.drawn > 200,
+      `нарисовано ${latticeInfo.drawn} из ${latticeInfo.count}`,
+    );
+    await delay(900);
+    const scene = await client.send('Page.captureScreenshot', { format: 'png' });
+    writeFileSync(resolve(OUT_DIR, 'lattice.png'), Buffer.from(scene.data, 'base64'));
+    console.log(`        ${OUT_DIR}/lattice.png — сцена кристалла крупным планом`);
   } finally {
     client?.socket?.destroy?.();
     child.kill();
