@@ -179,6 +179,13 @@ export class VerletList {
     const reach = cutoff + this.skin;
     const reachSq = reach * reach;
 
+    this.resize(count);
+    this.baseX.set(state.x.subarray(0, count));
+    this.baseY.set(state.y.subarray(0, count));
+    this.baseZ.set(state.z.subarray(0, count));
+
+    // Локальные ссылки на сетку и координаты: обход горячий, разыменование
+    // полей объекта в нём стоит заметно. Цикл повтора ниже пользуется ими же.
     const n = grid.n;
     const cellStart = grid.cellStart;
     const order = grid.order;
@@ -188,85 +195,132 @@ export class VerletList {
     const z = state.z;
     const half = box * 0.5;
 
-    this.resize(count);
-    this.baseX.set(x.subarray(0, count));
-    this.baseY.set(y.subarray(0, count));
-    this.baseZ.set(z.subarray(0, count));
+    /*
+     * Ёмкость буферов пар.
+     *
+     * Первая версия брала `count * 64` с комментарием «с запасом хватает».
+     * Запас оказался недостаточным: при ρ* = 1.3 радиус поиска с кожей равен
+     * 2.9σ, и соседей в нём около 66 на частицу — БОЛЬШЕ 64. Запись за конец
+     * `Int32Array` в JavaScript молча игнорируется, поэтому лишние пары
+     * просто исчезали: при N = 2048 и ρ* = 1.3 терялось 3565 пар из 79872
+     * (4.5 %), при N = 864 — 1500 из 33696. Силы в этих парах не считались,
+     * и система вела себя «странно», не падая.
+     *
+     * Теперь ёмкость выводится из физики: число соседей в шаре радиуса
+     * `reach` не больше `ρ · (4/3)π·reach³`, а список полуторный, поэтому
+     * достаточно половины. Множитель 1.6 — запас на флуктуации плотности и
+     * на то, что локальная плотность выше средней.
+     */
+    const density = count / (box * box * box);
+    const sphereVolume = (4 / 3) * Math.PI * reachSq * reach;
+    const estimate = Math.ceil(0.5 * 1.6 * density * sphereVolume * count);
+    this.ensurePairBuffers(Math.max(1024, estimate));
 
-    // Оценка сверху числа пар: список полуторный, поэтому 3 соседа на частицу
-    // с запасом хватает для плотных систем (реально ~55).
-    this.ensurePairBuffers(count * 64);
-
-    const pairA = this.pairA;
-    const pairB = this.pairB;
+    /*
+     * Сбор пар. Обход повторяется, если ёмкости не хватило: оценка выведена
+     * из СРЕДНЕЙ плотности, а локальная может быть выше (кристалл у стенки,
+     * сжатая система). Терять пары молча нельзя — это не падение, а тихо
+     * неправильная физика, поэтому буфер удваивается и проход повторяется.
+     * Повтор случается редко, поэтому на производительность не влияет.
+     */
+    let pairA = this.pairA;
+    let pairB = this.pairB;
     let total = 0;
 
-    for (let cell = 0; cell < cellCount; cell++) {
-      const gz = cell % n;
-      const gy = ((cell - gz) / n) % n;
-      const gx = (cell - gz - n * gy) / (n * n);
-      const startA = cellStart[cell];
-      const endA = cellStart[cell + 1];
-      if (startA === endA) continue;
+    for (;;) {
+      const capacity = pairA.length;
+      total = 0;
+      let overflowed = false;
 
-      for (let a = startA; a < endA; a++) {
-        const i = order[a];
-        const xi = x[i];
-        const yi = y[i];
-        const zi = z[i];
+      for (let cell = 0; cell < cellCount && !overflowed; cell++) {
+        const gz = cell % n;
+        const gy = ((cell - gz) / n) % n;
+        const gx = (cell - gz - n * gy) / (n * n);
+        const startA = cellStart[cell];
+        const endA = cellStart[cell + 1];
+        if (startA === endA) continue;
 
-        /* --- Своя ячейка: пары «вперёд» по индексу --- */
-        for (let b = a + 1; b < endA; b++) {
-          const j = order[b];
-          if (withinReach(x, y, z, j, xi, yi, zi, reachSq, box, half, periodic)) {
-            pairA[total] = i;
-            pairB[total] = j;
-            total++;
-          }
-        }
+        for (let a = startA; a < endA && !overflowed; a++) {
+          const i = order[a];
+          const xi = x[i];
+          const yi = y[i];
+          const zi = z[i];
 
-        /* --- 13 «передних» соседних ячеек --- */
-        for (let o = 0; o < OFFSET_COUNT; o++) {
-          const o3 = o * 3;
-          let nx = gx + OFFSETS[o3];
-          let ny = gy + OFFSETS[o3 + 1];
-          let nz = gz + OFFSETS[o3 + 2];
-          if (periodic) {
-            if (nx < 0) nx += n;
-            else if (nx >= n) nx -= n;
-            if (ny < 0) ny += n;
-            else if (ny >= n) ny -= n;
-            if (nz < 0) nz += n;
-            else if (nz >= n) nz -= n;
-          } else if (nx < 0 || nx >= n || ny < 0 || ny >= n || nz < 0 || nz >= n) {
-            continue;
-          }
-          const cell2 = (nx * n + ny) * n + nz;
-          const startB = cellStart[cell2];
-          const endB = cellStart[cell2 + 1];
-          if (startB === endB) continue;
-
-          for (let b = startB; b < endB; b++) {
+          /* --- Своя ячейка: пары «вперёд» по индексу --- */
+          for (let b = a + 1; b < endA; b++) {
             const j = order[b];
             if (withinReach(x, y, z, j, xi, yi, zi, reachSq, box, half, periodic)) {
-              // ВАЖНО: пара ячеек обработана один раз, но индексы i и j
-              // НЕ упорядочены — соседняя ячейка может содержать частицы
-              // с меньшими номерами. Полуторный список требует i < j,
-              // поэтому владельцем пары делаем МЕНЬШИЙ индекс, а соседом —
-              // больший. Без этого половина пар записывалась бы «наоборот»
-              // и терялась: силы считались бы не для всех соседей.
-              if (i < j) {
-                pairA[total] = i;
-                pairB[total] = j;
-              } else {
-                pairA[total] = j;
-                pairB[total] = i;
+              if (total === capacity) {
+                overflowed = true;
+                break;
               }
+              pairA[total] = i;
+              pairB[total] = j;
               total++;
             }
           }
+          if (overflowed) break;
+
+          /* --- 13 «передних» соседних ячеек --- */
+          for (let o = 0; o < OFFSET_COUNT; o++) {
+            const o3 = o * 3;
+            let nx = gx + OFFSETS[o3];
+            let ny = gy + OFFSETS[o3 + 1];
+            let nz = gz + OFFSETS[o3 + 2];
+            if (periodic) {
+              if (nx < 0) nx += n;
+              else if (nx >= n) nx -= n;
+              if (ny < 0) ny += n;
+              else if (ny >= n) ny -= n;
+              if (nz < 0) nz += n;
+              else if (nz >= n) nz -= n;
+            } else if (nx < 0 || nx >= n || ny < 0 || ny >= n || nz < 0 || nz >= n) {
+              continue;
+            }
+            const cell2 = (nx * n + ny) * n + nz;
+            const startB = cellStart[cell2];
+            const endB = cellStart[cell2 + 1];
+            if (startB === endB) continue;
+
+            for (let b = startB; b < endB; b++) {
+              const j = order[b];
+              if (withinReach(x, y, z, j, xi, yi, zi, reachSq, box, half, periodic)) {
+                if (total === capacity) {
+                  overflowed = true;
+                  break;
+                }
+                // ВАЖНО: пара ячеек обработана один раз, но индексы i и j
+                // НЕ упорядочены — соседняя ячейка может содержать частицы
+                // с меньшими номерами. Полуторный список требует i < j,
+                // поэтому владельцем пары делаем МЕНЬШИЙ индекс, а соседом —
+                // больший. Без этого половина пар записывалась бы «наоборот»
+                // и терялась: силы считались бы не для всех соседей.
+                if (i < j) {
+                  pairA[total] = i;
+                  pairB[total] = j;
+                } else {
+                  pairA[total] = j;
+                  pairB[total] = i;
+                }
+                total++;
+              }
+            }
+            if (overflowed) break;
+          }
         }
       }
+
+      if (!overflowed) break;
+      // Не хватило — удваиваем и считаем заново. Предел защищает от
+      // бесконечного цикла, если оценка ошибочна принципиально.
+      if (capacity >= count * 1024) {
+        throw new Error(
+          `Список соседей: не удалось уместить пары (${count} частиц, ёмкость ${capacity})`,
+        );
+      }
+      this.ensurePairBuffers(capacity * 2);
+      pairA = this.pairA;
+      pairB = this.pairB;
     }
 
     this.pairCount = total;
@@ -305,7 +359,13 @@ export class VerletList {
     }
   }
 
-  /** Буферы под пары и степени. */
+  /**
+   * Буферы под пары и степени.
+   *
+   * Размер НИКОГДА не уменьшается: буферы переиспользуются между
+   * перестроениями, и ужимать их значило бы заново выделять память в горячем
+   * пути. Растут — только когда ёмкости действительно не хватило.
+   */
   private ensurePairBuffers(capacity: number): void {
     const need = Math.max(1024, capacity);
     if (this.pairA.length < need) {

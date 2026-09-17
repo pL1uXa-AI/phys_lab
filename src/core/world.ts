@@ -19,7 +19,7 @@
  * гоняют тесты в чистом Node, и его же позже можно вынести в Web Worker.
  */
 
-import { computeForcesFromList, type ForceStats } from './forces.js';
+import { computeForcesDirect, computeForcesFromList, type ForceStats } from './forces.js';
 import { DEFAULT_SKIN, VerletList } from './neighbours.js';
 import { buildGrid, cellSizeFor } from './grid.js';
 import {
@@ -28,13 +28,19 @@ import {
   applyLangevin,
   applyNoseHoover,
   allocNoseHoover,
+  type BrushPlane,
   type NoseHooverState,
+  type ViewAxis,
+  clampSpeeds,
   drift,
+  freezeRegion as freezeRegionOf,
   kick,
+  maxStableSpeed,
   pokeRegion,
   reflectWalls,
   removeEscaped,
   setTemperature,
+  viewAxis as makeViewAxis,
 } from './integrator.js';
 import {
   buildState,
@@ -145,16 +151,75 @@ export class History {
   }
 }
 
-/** Заявка на «тычок» мышью: импульс в сфере. */
+/** Заявка на «тычок» мышью: цилиндр вдоль оси взгляда. */
 export interface PokeRequest {
-  x: number;
-  y: number;
-  z: number;
+  /** Ось взгляда и точка на ней. */
+  plane: BrushPlane;
+  /** Импульс в экранных направлениях (dx — экранный X, dy — экранный Y, dz — вглубь). */
   dx: number;
   dy: number;
   dz: number;
   radius: number;
   strength: number;
+}
+
+/**
+ * Квантиль величины по живым частицам, без полной сортировки.
+ *
+ * Нужна для верхней границы цветовой шкалы: одиночный выброс не должен
+ * управлять всей палитрой (см. `World.colorValues`).
+ *
+ * Реализация — гистограмма по логарифмической сетке от `min` до `max`.
+ * Линейная сетка здесь не годится: скорости распределены по Максвеллу с
+ * длинным «хвостом», и в верхних бакетах оказалось бы по одной частице, что
+ * делает квантиль неустойчивым. Логарифмическая сетка (128 бакетов на
+ * 12 декад) даёт ошибку в пределах нескольких процентов от самого значения —
+ * для цвета этого более чем достаточно.
+ *
+ * @param values массив значений (может содержать мусор за пределами count)
+ * @param count  сколько элементов массива действительно принадлежат частицам
+ * @param alive  маска живых частиц
+ */
+function quantileOf(
+  values: Float64Array,
+  count: number,
+  alive: Uint8Array,
+  q: number,
+  min: number,
+  max: number,
+): number {
+  if (!(max > min) || !Number.isFinite(min) || !Number.isFinite(max)) return max;
+  const BINS = 128;
+  const positives = min > 0;
+  // Логарифмическая сетка требует положительных значений; если минимум нулевой
+  // (так бывает у плотности и смещения), добавляем сдвиг.
+  const shift = positives ? 0 : Math.max(1e-6, (max - min) * 1e-3);
+  const lo = Math.log(min + shift);
+  const hi = Math.log(max + shift);
+  if (!(hi > lo) || !Number.isFinite(lo) || !Number.isFinite(hi)) return max;
+  const invSpan = BINS / (hi - lo);
+  const histogram = new Int32Array(BINS + 1);
+  let total = 0;
+  for (let i = 0; i < count; i++) {
+    if (alive[i] === 0) continue;
+    const v = values[i];
+    if (!Number.isFinite(v)) continue;
+    let b = Math.floor((Math.log(v + shift) - lo) * invSpan);
+    if (b < 0) b = 0;
+    else if (b > BINS) b = BINS;
+    histogram[b]++;
+    total++;
+  }
+  if (total === 0) return max;
+  const target = q * total;
+  let running = 0;
+  for (let b = 0; b <= BINS; b++) {
+    running += histogram[b];
+    if (running >= target) {
+      return Math.exp(lo + ((b + 0.5) / BINS) * (hi - lo)) - shift;
+    }
+  }
+  return max;
 }
 
 /** Мир целиком: частицы, параметры, статистика. */
@@ -201,6 +266,42 @@ export class World {
   /** Число перестроений за всю жизнь мира. */
   private listRebuilds = 0;
 
+  /**
+   * Кэш оси взгляда для кисти.
+   *
+   * Углы камеры не меняются между кликами, а `sin`/`cos` в горячем пути
+   * «протянул мышью — подействовало на сотни частиц» ни к чему. Кэш
+   * сбрасывается при смене углов; ключ — сами углы.
+   */
+  private axisCache: { yaw: number; pitch: number; axis: ViewAxis } | null = null;
+
+  /**
+   * Сколько частиц получило ограничение скорости на последнем шаге.
+   *
+   * Диагностика: ненулевое значение означает, что система подошла к пределу
+   * устойчивости дискретизации (см. `maxStableSpeed`). В штатной работе — 0.
+   */
+  private clampedLastStep = 0;
+
+  /** Сколько раз система восстанавливалась после NaN/Infinity. */
+  private recoveredFromNaN = 0;
+
+  /**
+   * Достаточно ли мелкая сетка, чтобы обход 27 ячеек был корректен.
+   *
+   * Инвариант: ячейка обязана быть НЕ МЕНЬШЕ радиуса поиска (rc + кожа).
+   * `makeGrid` строит не меньше трёх ячеек по оси, и в маленьком ящике
+   * `box / n` может оказаться меньше `rc + skin`. Тогда ближайший сосед
+   * попадает не в соседнюю ячейку, а через одну, и часть пар теряется МОЛЧА:
+   * силы просто не считаются, система «остывает».
+   *
+   * Измерено до исправления: N = 256, ρ* = 1.3 давали ячейку 1.94σ при
+   * требуемых 2.9σ, и список терял 451 пару из 9984 (4.5 %); N = 500 при той
+   * же плотности — 875 из 19500. Проверка кэшируется, потому что зависит
+   * только от геометрии, а не от координат.
+   */
+  private gridTooCoarse = false;
+
   constructor(params: Partial<WorldParams> = {}, seed = 20260214, lattice: LatticeKind = 'fcc') {
     this.params = { ...DEFAULT_PARAMS, ...params };
     this.rng = new Rng(seed);
@@ -243,7 +344,7 @@ export class World {
     const size = cellSizeFor(this.params.cutoff);
     const n = Math.max(3, Math.floor(this.box / size));
     const cells = n * n * n;
-    return {
+    const grid: CellGrid = {
       n,
       size: this.box / n,
       cellStart: new Int32Array(cells + 1),
@@ -251,6 +352,11 @@ export class World {
       cellIndex: new Int32Array(this.state.count),
       counts: new Int32Array(cells),
     };
+    // Радиус поиска — обрезание плюс кожа списка Верле. Сетка, которая его
+    // не вмещает, даёт не «медленно», а НЕПРАВИЛЬНО: пары теряются.
+    const searchRadius = this.params.cutoff + DEFAULT_SKIN;
+    this.gridTooCoarse = grid.size + 1e-9 < searchRadius;
+    return grid;
   }
 
   /**
@@ -258,6 +364,23 @@ export class World {
    * Вызывается после любой смены геометрии или координат «извне».
    */
   private rebuildForces(): void {
+    if (this.gridTooCoarse) {
+      // Сетка не вмещает радиус поиска — считаем честным перебором.
+      // Дороже на маленьких системах, но правильно; альтернатива — молча
+      // терять пары (см. `gridTooCoarse`).
+      this.stats = computeForcesDirect(
+        this.state,
+        this.box,
+        this.params.cutoff,
+        this.shift,
+        this.params.boundary === 'periodic',
+        true,
+      );
+      this.listAge = 0;
+      this.listRebuilt = true;
+      this.listRebuilds = 1;
+      return;
+    }
     buildGrid(this.state, this.grid);
     this.verlet.build(
       this.state,
@@ -289,6 +412,17 @@ export class World {
    */
   private updateForces(): void {
     this.listRebuilt = false;
+    if (this.gridTooCoarse) {
+      this.stats = computeForcesDirect(
+        this.state,
+        this.box,
+        this.params.cutoff,
+        this.shift,
+        this.params.boundary === 'periodic',
+        true,
+      );
+      return;
+    }
     if (this.verlet.needsRebuild(this.state, this.params.boundary === 'periodic', this.box)) {
       buildGrid(this.state, this.grid);
       this.verlet.build(
@@ -349,12 +483,37 @@ export class World {
 
     this.applyPending();
 
+    const frozen = this.hasFrozen();
+
     // 1. Половина толчка по силам с прошлого шага.
     kick(this.state, half);
+
+    // 1a. Замороженные обнуляются СРАЗУ после толчка.
+    //
+    // Раньше маска применялась только в конце шага. Этого недостаточно:
+    // `kick` успевал придать замороженной частице скорость F·dt/2, и `drift`
+    // тут же сдвигал её на (F·dt/2)·dt. За 200 шагов они «проезжали» 8σ —
+    // то есть «заморозить» означало «сильно замедлить», а не «остановить».
+    // Маскировать надо между толчком и дрейфом: тогда v = 0 на входе в дрейф
+    // и координата не меняется вовсе.
+    if (frozen) applyFrozenMask(this.state, this.frozen);
 
     // 2. Термостат: трогает только скорости.
     this.applyThermostat(dt);
 
+    // 2a. Термостат тоже трогает замороженных (Берендсен и Нозе-Хувер
+    // масштабируют ВСЕ скорости). Если маску не повторить, термостат
+    // «оживит» остановленные частицы, и они снова начнут дрейфовать.
+    if (frozen) applyFrozenMask(this.state, this.frozen);
+
+    // 2b. Предел устойчивости дискретизации.
+    //
+    // Численный выброс необратим: термостат убирает ~1 % энергии за шаг, а
+    // силы при разлёте растут экспоненциально, поэтому «остудить» улетевшую
+    // систему нельзя в принципе (измерено: 1.5·10¹⁹ → 1.16·10⁴⁷ за 100 шагов).
+    // Единственная защита — не дать скоростям превысить то, что шаг ещё
+    // разрешает. При штатных температурах ограничение не срабатывает.
+    this.clampedLastStep = clampSpeeds(this.state, maxStableSpeed(dt));
     // 3. Дрейф и границы.
     const periodic = this.params.boundary === 'periodic';
     drift(this.state, dt, this.box, periodic, true);
@@ -369,16 +528,63 @@ export class World {
     this.updateForces();
     kick(this.state, half);
 
-    // 5. Замороженные частицы снова обнуляются: сначала силе дали
-    // подействовать (иначе они «прилипали» бы к соседям), затем вернули
-    // строгую неподвижность.
-    if (this.hasFrozen()) applyFrozenMask(this.state, this.frozen);
+    // 5. И снова обнуляем: вторая половина толчка тоже добавила скорость.
+    if (frozen) applyFrozenMask(this.state, this.frozen);
 
     this.time += dt;
     this.steps++;
+
+    // 6. Замер и проверка на нечисловой мусор (NaN/Infinity).
+    //
+    // Даже с ограничением скорости возможны патологические комбинации
+    // (например, частица, «выброшенная» толчком точно в сердечник потенциала
+    // другой частицы). Тогда вся система мгновенно становится NaN, и все
+    // последующие вычисления бессмысленны: графики рисуют мусор, а игрок не
+    // понимает, что произошло. Дешевле обнаружить это здесь и восстановить
+    // состояние, чем оставить приложение в нерабочем виде.
     this.current = this.measureNow();
+    if (!Number.isFinite(this.current.temperature) || !Number.isFinite(this.current.total)) {
+      this.recoverFromNaN();
+      this.current = this.measureNow();
+    }
     this.history.push(this.makeSample());
     return this.current;
+  }
+
+  /**
+   * Восстановление системы после численного мусора.
+   *
+   * Координаты и скорости заменяются заново: если в них попал NaN или
+   * Infinity, он мгновенно «размазывается» по всей системе через силы, и
+   * сохранить что-то осмысленное всё равно нельзя. Частицы расставляются
+   * регулярной решёткой при целевой температуре — система продолжает работу,
+   * а игрок видит, что произошёл сброс, а не «застывшую» сцену.
+   */
+  private recoverFromNaN(): void {
+    const target = Number.isFinite(this.params.temperature)
+      ? Math.max(0.05, Math.min(3, this.params.temperature))
+      : 0.5;
+    const built = buildState(
+      'fcc',
+      this.params.count,
+      this.params.density,
+      target,
+      this.rng.nextUint32(),
+    );
+    this.state = built.state;
+    this.box = built.box;
+    this.frozen = new Uint8Array(built.state.count);
+    this.nh = allocNoseHoover();
+    this.grid = this.makeGrid();
+    this.verlet.resize(this.state.count);
+    recallReferences(this.state);
+    this.rebuildForces();
+    this.recoveredFromNaN++;
+  }
+
+  /** Сколько раз система восстанавливалась после численного мусора. */
+  get nanRecoveries(): number {
+    return this.recoveredFromNaN;
   }
 
   /**
@@ -461,9 +667,7 @@ export class World {
       this.pendingPoke = null;
       pokeRegion(
         this.state,
-        p.x,
-        p.y,
-        p.z,
+        p.plane,
         this.box,
         p.radius,
         p.strength,
@@ -483,9 +687,16 @@ export class World {
   /**
    * Перестройка мира под текущие count/density с выбранной решёткой.
    * История и g(r) сбрасываются: это уже другая система.
+   *
+   * @param keepTemperature сохранять ли заданную T*. Сейчас оба значения
+   *   совпадают: цель термостата переносится всегда, и отдельного «сбросить
+   *   температуру к исходной» сценария в интерфейсе нет. Параметр оставлен,
+   *   потому что он часть контракта вызывающих (`requestRebuild`) и точка
+   *   расширения для «пересобрать холодным».
    */
   rebuild(kind: LatticeKind, keepTemperature: boolean): void {
-    const temperature = keepTemperature ? this.params.temperature : this.params.temperature;
+    const temperature = this.params.temperature;
+    void keepTemperature;
     const count = this.params.count;
     const built = buildState(
       kind,
@@ -578,8 +789,25 @@ export class World {
     this.history.push(this.makeSample());
   }
 
-  /** Полная остановка: все скорости обнуляются. */
+  /**
+   * Полная остановка: обнуляются скорости И ставится маска заморозки.
+   *
+   * ─── Почему одной установки скоростей в ноль недостаточно ─────────────────
+   *
+   * Раньше здесь было только `vx.fill(0); vy.fill(0); vz.fill(0)`. Это
+   * «остановить на мгновение», а не «заморозить»: уже на следующем шаге
+   * `kick` придаёт частицам скорость по действующим силам, а термостат
+   * (Берендсен, Лангевеи, Нозе-Хувер) возвращает их к заданной T* — потому что
+   * при обнулённых скоростях измеренная температура равна нулю, и для
+   * термостата это максимальное отклонение от цели. В результате кнопка
+   * выглядела сломанной: «заморозил, а они двигаются».
+   *
+   * Теперь ставится маска: она обнуляет скорости на каждой стадии шага
+   * (после каждого толчка и после термостата), поэтому частицы действительно
+   * стоят. Парная кнопка «Разморозить» снимает маску и возвращает подвижность.
+   */
   freezeAll(): void {
+    this.frozen.fill(1);
     this.state.vx.fill(0);
     this.state.vy.fill(0);
     this.state.vz.fill(0);
@@ -599,47 +827,44 @@ export class World {
     this.history.push(this.makeSample());
   }
 
-  /** Заморозить частицы, попавшие в сферу вокруг точки. */
-  freezeRegion(cx: number, cy: number, cz: number, radius: number): number {
-    const periodic = this.params.boundary === 'periodic';
-    let touched = 0;
-    for (let i = 0; i < this.state.count; i++) {
-      if (this.state.alive[i] === 0) continue;
-      let dx = this.state.x[i] - cx;
-      let dy = this.state.y[i] - cy;
-      let dz = this.state.z[i] - cz;
-      if (periodic) {
-        dx -= this.box * Math.round(dx / this.box);
-        dy -= this.box * Math.round(dy / this.box);
-        dz -= this.box * Math.round(dz / this.box);
-      }
-      if (dx * dx + dy * dy + dz * dz > radius * radius) continue;
-      this.frozen[i] = 1;
-      this.state.vx[i] = 0;
-      this.state.vy[i] = 0;
-      this.state.vz[i] = 0;
-      touched++;
-    }
-    return touched;
-  }
-
   /** Снять заморозку со всех. */
   unfreezeAll(): void {
     this.frozen.fill(0);
   }
 
-  /** Заявка на «тычок» мышью: применится на ближайшем шаге. */
+  /**
+   * Заявка на «тычок» мышью.
+   *
+   * Импульсы НАКАПЛИВАЮТСЯ, а не перекрываются: за один шаг физики мышь
+   * успевает прислать несколько событий `pointermove`, и каждое несёт свой
+   * кусочек протяжки. Если бы последнее перекрывало предыдущие, толчок
+   * зависел бы от частоты событий мыши (у разных устройств она разная), а не
+   * от длины протяжки.
+   *
+   * Накопленный вектор применяется один раз за шаг и ограничивается сверху
+   * в `pokeRegion` (см. `MAX_POKE_SPEED`) — иначе долгая протяжка разгоняла
+   * систему до нефизических скоростей.
+   */
   requestPoke(poke: PokeRequest): void {
-    this.pendingPoke = poke;
+    const pending = this.pendingPoke;
+    if (pending) {
+      pending.dx += poke.dx;
+      pending.dy += poke.dy;
+      pending.dz += poke.dz;
+      // Кисть могла переехать — берём её последнее положение и радиус.
+      pending.plane = poke.plane;
+      pending.radius = poke.radius;
+      pending.strength = poke.strength;
+    } else {
+      this.pendingPoke = { ...poke };
+    }
   }
 
-  /** Применить «тычок» немедленно — нужно тестам и скриптам. */
+  /** Применить «тычок» немедленно — нужно тестам, скриптам и работе на паузе. */
   pokeNow(poke: PokeRequest): void {
     pokeRegion(
       this.state,
-      poke.x,
-      poke.y,
-      poke.z,
+      poke.plane,
       this.box,
       poke.radius,
       poke.strength,
@@ -648,6 +873,54 @@ export class World {
       poke.dz,
       this.params.boundary === 'periodic',
     );
+  }
+
+  /**
+   * Применить накопленный «тычок» сейчас, не дожидаясь шага.
+   *
+   * Нужно на паузе: шагов нет, а `applyPending` вызывается только из `step`,
+   * поэтому без явного сброса протяжка мышью на паузе не давала бы никакого
+   * отклика — игрок не увидел бы даже, куда попал.
+   */
+  flushPoke(): void {
+    if (!this.pendingPoke) return;
+    const p = this.pendingPoke;
+    this.pendingPoke = null;
+    this.pokeNow(p);
+  }
+
+  /**
+   * Инструмент «заморозить»: цилиндр вдоль оси взгляда.
+   *
+   * Раньше здесь стояла сфера вокруг точки на плоскости экрана. Вместе с
+   * кистью это давало один и тот же дефект: доступным оказывался только
+   * средний слой частиц (см. `integrator.BrushPlane`).
+   */
+  freezeRegion(plane: BrushPlane, radius: number): number {
+    return freezeRegionOf(
+      this.state,
+      this.frozen,
+      plane,
+      this.box,
+      radius,
+      this.params.boundary === 'periodic',
+    );
+  }
+
+  /**
+   * Ось взгляда по углам камеры, с кэшем.
+   *
+   * Кисть и проекция обязаны пользоваться ОДНИМ расчётом ориентации: если
+   * вывести ось в одном месте, а строки матрицы в другом, они рано или поздно
+   * разойдутся, и клик начнёт попадать мимо. Здесь же `sin`/`cos` считаются
+   * один раз на смену углов, а не на каждую протяжку мыши.
+   */
+  viewAxis(yaw: number, pitch: number): ViewAxis {
+    const cached = this.axisCache;
+    if (cached && cached.yaw === yaw && cached.pitch === pitch) return cached.axis;
+    const axis = makeViewAxis(yaw, pitch);
+    this.axisCache = { yaw, pitch, axis };
+    return axis;
   }
 
   /* ------------------------------------------------------------------ */
@@ -659,9 +932,38 @@ export class World {
     return this.current;
   }
 
-  /** Число пар в пределах обрезания на последнем шаге — диагностика сетки. */
+  /**
+   * Число пар в пределах обрезания на последнем шаге — диагностика сетки.
+   */
   get pairCount(): number {
     return this.stats.pairs;
+  }
+
+  /**
+   * Вмещает ли ячейка текущей сетки радиус поиска.
+   *
+   * Открыто наружу для диагностики и тестов: если `false`, мир считает силы
+   * прямым перебором, и это НЕ ошибка, а правильное поведение (см.
+   * `gridTooCoarse`). Но знать об этом нужно: на такой системе цена шага
+   * квадратична по N.
+   */
+  get gridIsSafe(): boolean {
+    return !this.gridTooCoarse;
+  }
+
+  /** Используется ли список соседей Верле (то есть работает ли «кожа»). */
+  get usingVerletList(): boolean {
+    return !this.gridTooCoarse;
+  }
+
+  /**
+   * Сколько частиц упёрлось в предел устойчивости на последнем шаге.
+   *
+   * Открыто наружу, чтобы интерфейс и проверки могли отличить «система
+   * действительно горячая» от «система улетела и её удерживает ограничитель».
+   */
+  get speedClampedCount(): number {
+    return this.clampedLastStep;
   }
 
   /**
@@ -758,8 +1060,27 @@ export class World {
       for (let i = 0; i < n; i++) {
         if (this.state.alive[i] === 0) continue;
         const v = out[i];
+        if (!Number.isFinite(v)) continue;
         if (v < min) min = v;
         if (v > max) max = v;
+      }
+      // Верхняя граница шкалы — квантиль, а не абсолютный максимум.
+      //
+      // ─── Почему нельзя брать просто max ────────────────────────────────
+      //
+      // Достаточно ОДНОЙ частицы с аномальной скоростью, чтобы весь диапазон
+      // шкалы схлопнулся: max становится 10²³, а все остальные получают
+      // t = (v − min)/(max − min) ≈ 1e−24, то есть одинаковый «медленный»
+      // цвет. Измерено: при выбросе 100 % частиц получали t < 0.05, и картинка
+      // переставала меняться — ровно то, что видно как «частицы не меняют
+      // цвет». Именно так выглядит начало численного разлёта.
+      //
+      // 0.995 отсекает верхние 0.5 % значений: одиночный выброс больше не
+      // управляет всей палитрой, а физически осмысленный разброс (газ, где
+      // быстрых частиц много) сохраняется — квантиль по построению устойчив
+      // к выбросам, но не «зажимает» широкое распределение.
+      if (Number.isFinite(max) && Number.isFinite(min) && max > min) {
+        max = quantileOf(out, n, this.state.alive, 0.995, min, max);
       }
     }
     if (!Number.isFinite(min) || !Number.isFinite(max)) {

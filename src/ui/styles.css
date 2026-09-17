@@ -87,6 +87,22 @@ body {
   white-space: nowrap;
 }
 
+/*
+ * Сводка справа в верхней панели.
+ *
+ * Это основной «прибор» (T*, E, N, P*), но раньше она выглядела как обычный
+ * текст и не выделялась среди кнопок. Плашка с фоном и рамкой отделяет её от
+ * кнопок и делает читаемой с первого взгляда.
+ */
+.topbar__field[data-field='stats'] {
+  padding: 3px 9px;
+  background: #0f1926;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--text);
+  letter-spacing: 0.01em;
+}
+
 .topbar__field b {
   color: var(--text);
   font-weight: 600;
@@ -138,6 +154,19 @@ body {
   background: #24506f;
   border-color: #3d7dad;
   color: #eaf6ff;
+}
+
+/*
+ * Отклик кнопки «Шаг».
+ *
+ * Один шаг физики визуально почти ничего не меняет, поэтому нажатие выглядит
+ * «пустым». Короткая вспышка подтверждает, что шаг сделан, и заодно отличает
+ * одиночный шаг от «Пуск».
+ */
+.btn--flash {
+  background: #2b6d9e !important;
+  border-color: #4f9fd4 !important;
+  color: #f2f9ff;
 }
 
 .btn:disabled {
@@ -199,6 +228,14 @@ body {
   height: 100%;
 }
 
+/*
+ * Сводка по системе на сцене.
+ *
+ * Раньше это был обычный текст с тенью: он читался как подпись и терялся на
+ * фоне частиц, хотя это главный «прибор» приложения. Теперь это карточка со
+ * своим фоном, рамкой и скруглением — цифры читаются на любой картинке и не
+ * сливаются со сценой.
+ */
 .stage__hud {
   position: absolute;
   left: 10px;
@@ -207,12 +244,16 @@ body {
   font-size: 11px;
   color: var(--text-dim);
   pointer-events: none;
-  text-shadow: 0 1px 3px #000;
-  line-height: 1.6;
+  line-height: 1.62;
+  padding: 7px 10px;
+  background: rgba(9, 14, 22, 0.74);
+  border: 1px solid #1e2c3d;
+  border-radius: var(--radius);
 }
 
 .stage__hud b {
   color: var(--text);
+  font-weight: 600;
 }
 
 .stage__hint {
@@ -407,6 +448,29 @@ body {
   height: 8px;
   border-radius: 2px;
   border: 1px solid #223041;
+}
+
+/*
+ * Числа на концах легенды.
+ *
+ * Раньше здесь стояли слова «мин» и «макс»: они объясняли направление шкалы,
+ * но не отвечали на главный вопрос — ЧТО именно кодирует цвет. Теперь сюда
+ * подставляются настоящие значения из той же функции, которой красится
+ * рендер (`world.colorValues`), вместе с единицами (σ/τ для скорости, σ для
+ * смещения). Такая ширина выбрана, чтобы «0.00 σ/τ» помещалось целиком.
+ */
+.legend__bound {
+  min-width: 46px;
+  color: var(--text-mute);
+  white-space: nowrap;
+}
+
+.legend__bound[data-legend='min'] {
+  text-align: right;
+}
+
+.legend__bound[data-legend='max'] {
+  text-align: left;
 }
 
 .stats {

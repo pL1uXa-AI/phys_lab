@@ -794,7 +794,10 @@ async function main() {
         await new Promise(r => setTimeout(r, 200));
         const w = app.world;
         const before = w.frozen.reduce((a, b) => a + b, 0);
-        w.freezeRegion(w.box / 2, w.box / 2, w.box / 2, 4);
+        // Кисть задаётся осью взгляда: цилиндр вдоль луча зрения.
+        const axis = w.viewAxis(app.camera.yaw, app.camera.pitch);
+        const plane = { w: axis, center: { x: w.box / 2, y: w.box / 2, z: w.box / 2 } };
+        w.freezeRegion(plane, 4);
         const after = w.frozen.reduce((a, b) => a + b, 0);
         w.unfreezeAll();
         const cleared = w.frozen.reduce((a, b) => a + b, 0);
@@ -923,7 +926,392 @@ async function main() {
         `ρ* ${resize.actualDensity.toFixed(4)}`,
     );
 
-    /* --- 20. Скриншот витрины --- */
+    /* --- 20b. Соседи не теряются во всём диапазоне ползунков --- */
+    // Дефект, который видно только по числам: в маленьком ящике ячейка сетки
+    // оказывалась меньше радиуса поиска, и часть пар исчезала молча. Второй
+    // источник той же беды — буфер пар списка Верле (count * 64), которого не
+    // хватало при ρ* = 1.3: соседей около 66 на частицу. Оба случая дают
+    // «странную» физику без падения, поэтому проверяем число пар против
+    // честного перебора прямо в браузере.
+    const pairIntegrity = await client.evaluate(`
+      (() => {
+        const app = window.__physLab;
+        const rows = [];
+        const combos = [[256,1.3],[500,1.3],[864,1.3],[2048,1.3],[512,0.4],[1024,0.7],[2048,0.95]];
+        for (const [count, density] of combos) {
+          app.world.resize(count, density, 'fcc');
+          const st = app.world.state, box = app.world.box;
+          let truth = 0;
+          for (let i = 0; i < st.count; i++) {
+            for (let j = i + 1; j < st.count; j++) {
+              let dx = st.x[j] - st.x[i], dy = st.y[j] - st.y[i], dz = st.z[j] - st.z[i];
+              dx -= box * Math.round(dx / box);
+              dy -= box * Math.round(dy / box);
+              dz -= box * Math.round(dz / box);
+              const r2 = dx*dx + dy*dy + dz*dz;
+              if (r2 < 6.25 && r2 > 0) truth++;
+            }
+          }
+          rows.push({ count: st.count, density, pairs: app.world.pairCount, truth, safe: app.world.gridIsSafe });
+        }
+        app.world.resize(2048, 0.95, 'fcc');
+        return rows;
+      })()
+    `, 120000);
+    const lost = pairIntegrity.filter((row) => row.pairs !== row.truth);
+    check(
+      'соседи не теряются ни в одной комбинации ползунков',
+      lost.length === 0,
+      lost.length
+        ? lost.map((r) => `N=${r.count} ρ*=${r.density}: ${r.pairs} вместо ${r.truth}`).join('; ')
+        : pairIntegrity.map((r) => `${r.count}@${r.density}=${r.truth}`).join(' '),
+    );
+
+    /* --- 20c. Кисть достаёт до всех частиц, а не до среднего слоя --- */
+    // Дефект: обратная проекция восстанавливала точку на «плоскости экрана»,
+    // и сфера захвата накрывала только средний слой. Клик в любую точку
+    // экрана задевал один и тот же диапазон по y (измерено 4.2…9.7σ при
+    // ящике 14σ), то есть большая часть частиц была недостижима. Теперь
+    // кисть — цилиндр вдоль луча зрения: проверяем покрытие и разброс по y.
+    const brushCoverage = await client.evaluate(`
+      (async () => {
+        const app = window.__physLab;
+        app.actions.applyPreset('liquid');
+        await new Promise(r => setTimeout(r, 250));
+        const w = app.world;
+        const canvas = document.querySelector('.stage canvas');
+        const rect = canvas.getBoundingClientRect();
+        const hit = new Uint8Array(w.state.count);
+        const fire = (t, x, y, b) => canvas.dispatchEvent(new PointerEvent(t, {
+          clientX: x, clientY: y, buttons: b, button: 0, bubbles: true, pointerId: 1,
+        }));
+        let minY = Infinity, maxY = -Infinity;
+        for (let gy = 0; gy < 7; gy++) {
+          for (let gx = 0; gx < 7; gx++) {
+            for (let i = 0; i < w.state.count; i++) { w.state.vx[i]=0; w.state.vy[i]=0; w.state.vz[i]=0; }
+            const cx = rect.left + rect.width * (gx + 0.5) / 7;
+            const cy = rect.top + rect.height * (gy + 0.5) / 7;
+            fire('pointerdown', cx, cy, 1);
+            fire('pointermove', cx + 12, cy, 1);
+            fire('pointerup', cx + 12, cy, 0);
+            // Импульс применяется на ближайшем кадре (он накапливается),
+            // поэтому прогоняем шаг, прежде чем читать скорости.
+            app.actions.runSteps(1);
+            for (let i = 0; i < w.state.count; i++) {
+              if (Math.abs(w.state.vx[i]) + Math.abs(w.state.vy[i]) + Math.abs(w.state.vz[i]) > 1e-9) {
+                hit[i] = 1;
+                if (w.state.y[i] < minY) minY = w.state.y[i];
+                if (w.state.y[i] > maxY) maxY = w.state.y[i];
+              }
+            }
+          }
+        }
+        let total = 0;
+        for (let i = 0; i < w.state.count; i++) total += hit[i];
+        return { count: w.state.count, fraction: total / w.state.count, box: w.box, spread: maxY - minY };
+      })()
+    `, 300000);
+    check(
+      'кисть достаёт до большинства частиц',
+      brushCoverage.fraction > 0.85,
+      `достижимо ${(brushCoverage.fraction * 100).toFixed(0)} % частиц`,
+    );
+    check(
+      'кисть задевает частицы по всей глубине ящика',
+      brushCoverage.spread / brushCoverage.box > 0.7,
+      `разброс по y ${brushCoverage.spread.toFixed(1)}σ при ящике ${brushCoverage.box.toFixed(1)}σ`,
+    );
+
+    /* --- 20d. Легенда раскраски объясняет цвет числами --- */
+    const legendValues = await client.evaluate(`
+      (async () => {
+        const app = window.__physLab;
+        const read = () => ({
+          min: document.querySelector('[data-legend="min"]')?.textContent ?? '',
+          max: document.querySelector('[data-legend="max"]')?.textContent ?? '',
+        });
+        app.actions.applyPreset('liquid');
+        await new Promise(r => setTimeout(r, 900));
+        const speed = read();
+        const travelBtn = [...document.querySelectorAll('[data-panel="view"] .toggle__item')]
+          .find(b => b.textContent === 'Смещение');
+        if (travelBtn) travelBtn.click();
+        await new Promise(r => setTimeout(r, 900));
+        return { speed, travel: read() };
+      })()
+    `, 60000);
+    check(
+      'легенда раскраски показывает числовые границы шкалы',
+      legendValues.speed.min !== '—' && legendValues.speed.max !== '—' && legendValues.travel.min !== '—',
+      `скорость ${legendValues.speed.min}…${legendValues.speed.max}, ` +
+        `смещение ${legendValues.travel.min}…${legendValues.travel.max}`,
+    );
+
+    /* --- 20e. Флажок автоподстройки шагов управляет состоянием --- */
+    const autoToggle = await client.evaluate(`
+      (() => {
+        const app = window.__physLab;
+        const box = [...document.querySelectorAll('[data-panel="view"] .field--check')]
+          .find(f => f.textContent.includes('автоматически'))
+          ?.querySelector('input');
+        if (!box) return { error: 'флажок не найден' };
+        const before = app.state.autoSteps;
+        box.click();
+        const off = app.state.autoSteps;
+        box.click();
+        return { before, off, back: app.state.autoSteps };
+      })()
+    `);
+    check(
+      'автоподстройка шагов включается и выключается из интерфейса',
+      !autoToggle.error && autoToggle.before === true && autoToggle.off === false && autoToggle.back === true,
+      autoToggle.error ?? 'флажок найден и работает',
+    );
+
+    /* --- 20f. «Остановить» действительно останавливает --- */
+    // Дефект: кнопка обнуляла скорости один раз, и уже на следующем шаге
+    // силы с термостатом разгоняли частицы заново. За 200 шагов кристалл
+    // «проезжал» 8σ при заявленной остановке — со стороны это выглядело
+    // как «заморозил, а они двигаются».
+    const frozenStill = await client.evaluate(`
+      (async () => {
+        const app = window.__physLab;
+        app.actions.applyPreset('crystal');
+        app.actions.runSteps(200);
+        // Кнопка «Остановить» в панели «Воздействия».
+        const stopBtn = [...document.querySelectorAll('.btn')].find(b => b.textContent === 'Остановить');
+        if (!stopBtn) return { error: 'нет кнопки «Остановить»' };
+        stopBtn.click();
+        const x0 = Array.from(app.world.state.x);
+        app.actions.runSteps(400);
+        let maxMove = 0, maxSpeed = 0;
+        for (let i = 0; i < app.world.state.count; i++) {
+          maxMove = Math.max(maxMove, Math.abs(app.world.state.x[i] - x0[i]));
+          maxSpeed = Math.max(maxSpeed, Math.abs(app.world.state.vx[i]));
+        }
+        const frozenCount = app.world.frozen.reduce((a, b) => a + b, 0);
+        const t = app.world.measurement.temperature;
+        const thawBtn = [...document.querySelectorAll('.btn')].find(b => b.textContent === 'Разморозить');
+        thawBtn.click();
+        app.actions.runSteps(200);
+        const thawed = app.world.measurement.temperature;
+        return { maxMove, maxSpeed, frozenCount, t, thawed, count: app.world.state.count };
+      })()
+    `, 120000);
+    check(
+      '«Остановить» действительно обнуляет движение',
+      !frozenStill.error && frozenStill.maxMove < 1e-9 && frozenStill.maxSpeed < 1e-9,
+      frozenStill.error ??
+        `сдвиг ${frozenStill.maxMove.toExponential(1)}σ, скорость ${frozenStill.maxSpeed.toExponential(1)}, ` +
+          `заморожено ${frozenStill.frozenCount}`,
+    );
+    check(
+      '«Разморозить» возвращает систему к жизни',
+      !frozenStill.error && frozenStill.thawed > 0.05,
+      frozenStill.error ?? `T* после разморозки ${frozenStill.thawed.toFixed(3)}`,
+    );
+
+    /* --- 20g2. Нагрев и сжатие не уводят систему в необратимый разлёт --- */
+    // Дефект из отзыва: «после сильного нагрева и сжатия ни охлаждение, ни
+    // расширение не помогает их остановить». Причина — потеря устойчивости
+    // дискретизации: силы растут экспоненциально, а термостат убирает ~1 %
+    // энергии за шаг. Измерено до исправления: T* = 1.45·10³⁹ → 5.7·10⁸⁴,
+    // полная энергия 10⁴⁷, и вернуть это было нельзя ничем.
+    const runaway = await client.evaluate(`
+      (async () => {
+        const app = window.__physLab;
+        app.actions.applyPreset('crystal');
+        app.actions.runSteps(200);
+        const heat = [...document.querySelectorAll('.btn')].find(b => b.textContent === 'Нагреть');
+        const squeeze = [...document.querySelectorAll('.btn')].find(b => b.textContent === 'Сжать');
+        for (let i = 0; i < 14; i++) { heat.click(); app.actions.runSteps(30); }
+        for (let i = 0; i < 6; i++) { squeeze.click(); app.actions.runSteps(30); }
+        // Пытаемся вернуть систему: охлаждение и расширение.
+        const cool = [...document.querySelectorAll('.btn')].find(b => b.textContent === 'Остудить');
+        const expand = [...document.querySelectorAll('.btn')].find(b => b.textContent === 'Расширить');
+        for (let i = 0; i < 10; i++) { cool.click(); expand.click(); app.actions.runSteps(40); }
+        app.actions.runSteps(600);
+        const m = app.metrics();
+        return {
+          temperature: m.temperature, energy: m.pressure,
+          pot: app.world.potentialEnergy,
+          finite: Number.isFinite(m.temperature) && Number.isFinite(app.world.potentialEnergy),
+          clamped: app.world.speedClampedCount,
+        };
+      })()
+    `, 300000);
+    check(
+      'нагрев и сжатие не уводят систему в необратимый разлёт',
+      runaway.finite && runaway.temperature < 200,
+      `T* ${runaway.temperature.toExponential(2)}, E_пот ${runaway.pot.toExponential(2)}, ` +
+        `ограничено скоростей ${runaway.clamped}`,
+    );
+
+    /* --- 20g3. Раскраска не «застывает» при выбросе скорости --- */
+    // Дефект из отзыва: «частицы не меняют цвет». Шкала бралась по максимуму,
+    // поэтому одной частицы со скоростью 10²³ хватало, чтобы ВСЕ остальные
+    // получили t ≈ 1e−24 и одинаковый цвет.
+    const colorScale = await client.evaluate(`
+      (async () => {
+        const app = window.__physLab;
+        app.actions.applyPreset('liquid');
+        app.actions.setThermostat('none');
+        app.actions.runSteps(200);
+        const normal = app.world.colorValues('speed');
+        app.world.state.vx[0] = 1e23;
+        app.actions.runSteps(1);
+        const spiked = app.world.colorValues('speed');
+        // Доля частиц, у которых цвет «прилип» к нижнему краю шкалы.
+        let flat = 0, counted = 0;
+        for (let i = 1; i < app.world.state.count; i++) {
+          if (app.world.state.alive[i] === 0) continue;
+          const t = (spiked.values[i] - spiked.min) / (spiked.max - spiked.min);
+          if (t < 0.05) flat++;
+          counted++;
+        }
+        return {
+          normalMax: normal.max, spikedMax: spiked.max,
+          flatFraction: flat / counted,
+        };
+      })()
+    `, 120000);
+    check(
+      'выброс одной скорости не делает все частицы одного цвета',
+      colorScale.spikedMax < colorScale.normalMax * 6 && colorScale.flatFraction < 0.1,
+      `верх шкалы ${colorScale.normalMax.toFixed(2)} → ${colorScale.spikedMax.toFixed(2)}, ` +
+        `«прилипло» к низу ${(colorScale.flatFraction * 100).toFixed(1)} %`,
+    );
+
+    /* --- 20g. Протяжка мышью не разгоняет систему до абсурда --- */
+    // Дефект: импульс прибавлялся на каждом событии движения и был
+    // пропорционален всему пути курсора. Протяжка 200 px давала 37 σ/τ
+    // (тепловая скорость ≈ 1.7), кристалл разгонялся до T* = 3.6, а
+    // «протянуть и подождать» уводило полную энергию в 10¹⁷.
+    const pokeLimit = await client.evaluate(`
+      (async () => {
+        const app = window.__physLab;
+        app.actions.applyPreset('crystal');
+        await new Promise(r => setTimeout(r, 200));
+        const axis = app.world.viewAxis(app.camera.yaw, app.camera.pitch);
+        const center = { x: app.world.box/2, y: app.world.box/2, z: app.world.box/2 };
+        app.world.pokeNow({
+          plane: { w: axis, center },
+          dx: 200, dy: 120, dz: 0, radius: 3, strength: 1,
+        });
+        let maxSpeed = 0;
+        for (let i = 0; i < app.world.state.count; i++) {
+          maxSpeed = Math.max(maxSpeed, Math.abs(app.world.state.vx[i]), Math.abs(app.world.state.vy[i]));
+        }
+        app.actions.runSteps(300);
+        return {
+          maxSpeed,
+          temperature: app.world.measurement.temperature,
+          energy: app.world.measurement.total,
+        };
+      })()
+    `, 120000);
+    check(
+      'огромная протяжка не разгоняет систему до абсурда',
+      pokeLimit.maxSpeed <= 4 + 1e-6 && Number.isFinite(pokeLimit.energy) && pokeLimit.temperature < 10,
+      `max|v| ${pokeLimit.maxSpeed.toFixed(2)} σ/τ, T* ${pokeLimit.temperature.toFixed(2)}, ` +
+        `E ${pokeLimit.energy.toExponential(2)}`,
+    );
+
+    /* --- 20h. Показатели обновляются, а не застывают --- */
+    // Дефект-подозрение из отзыва: «температура, плотность и число частиц на
+    // ползунках статичны». Проверяем, что сводка и ползунки РЕАГИРУЮТ на
+    // реальные процессы: после нагрева показанная T* обязана вырасти, а после
+    // смены плотности — измениться подпись ползунка.
+    const liveReadouts = await client.evaluate(`
+      (async () => {
+        const app = window.__physLab;
+        const stats = () => document.querySelector('[data-field="stats"]').textContent;
+        const outputOf = (label) => [...document.querySelectorAll('.field')]
+          .find(f => f.querySelector('.field__label')?.textContent === label)
+          ?.querySelector('output').textContent;
+
+        app.actions.applyPreset('crystal');
+        app.actions.setThermostat('none');
+        app.actions.runSteps(300);
+        const cold = { text: stats(), t: app.world.measurement.temperature };
+
+        // Нагреваем кнопкой и смотрим, изменилась ли сводка.
+        app.actions.runSteps(50);
+        const beforeHeat = app.world.measurement.temperature;
+        for (let i = 0; i < 6; i++) {
+          const btn = [...document.querySelectorAll('.btn')].find(b => b.textContent === 'Нагреть');
+          btn.click();
+          app.actions.runSteps(40);
+        }
+        const afterHeat = app.world.measurement.temperature;
+        const hot = { text: stats(), t: afterHeat };
+
+        // Смена плотности обязана обновить подпись ползунка.
+        const rhoBefore = outputOf('Плотность ρ*');
+        app.actions.setDensity(0.55);
+        await new Promise(r => setTimeout(r, 400));
+        const rhoAfter = outputOf('Плотность ρ*');
+        return {
+          coldT: cold.t, hotT: hot.t, statsChanged: cold.text !== hot.text,
+          rhoBefore, rhoAfter, statedDensity: app.world.params.density,
+        };
+      })()
+    `, 120000);
+    check(
+      'Т* в сводке отражает реальный нагрев, а не застывшее значение',
+      liveReadouts.hotT > liveReadouts.coldT + 0.3 && liveReadouts.statsChanged,
+      `T* ${liveReadouts.coldT.toFixed(2)} → ${liveReadouts.hotT.toFixed(2)}, сводка обновилась: ${liveReadouts.statsChanged}`,
+    );
+    check(
+      'ползунок плотности обновляется при программном изменении',
+      liveReadouts.rhoBefore !== liveReadouts.rhoAfter &&
+        Math.abs(Number(liveReadouts.rhoAfter) - liveReadouts.statedDensity) < 0.02,
+      `«${liveReadouts.rhoBefore}» → «${liveReadouts.rhoAfter}» при ρ* = ${liveReadouts.statedDensity.toFixed(2)}`,
+    );
+
+    /* --- 20i. g(r) согласована с честным перебором в маленьком ящике --- */
+    // Дефект 18: сетка g(r) проверялась по числу ячеек (n < 3), а не по
+    // фактическому размеру, поэтому в маленьком ящике ячейка оказывалась
+    // меньше максимального радиуса (3.5σ) и часть пар терялась. Проверяем
+    // интеграл g(r) против прямого перебора — они обязаны совпасть.
+    const radialIntegrity = await client.evaluate(`
+      (() => {
+        const app = window.__physLab;
+        app.world.resize(500, 1.3, 'fcc');
+        const w = app.world;
+        w.radial.reset();
+        w.sampleRadial();
+        const { r, g } = w.radialDistribution();
+        const volume = w.box ** 3;
+        const pairsTotal = (w.state.count * (w.state.count - 1)) / 2;
+        let integrated = 0;
+        for (let k = 0; k < r.length; k++) {
+          integrated += g[k] * pairsTotal * 4 * Math.PI * r[k] * r[k] * w.radial.dr / volume;
+        }
+        let truth = 0;
+        const st = w.state, box = w.box;
+        for (let i = 0; i < st.count; i++) {
+          for (let j = i + 1; j < st.count; j++) {
+            let dx = st.x[j] - st.x[i], dy = st.y[j] - st.y[i], dz = st.z[j] - st.z[i];
+            dx -= box * Math.round(dx / box);
+            dy -= box * Math.round(dy / box);
+            dz -= box * Math.round(dz / box);
+            const r2 = dx*dx + dy*dy + dz*dz;
+            if (r2 > 0 && r2 < 12.25) truth++;
+          }
+        }
+        app.world.resize(2048, 0.95, 'fcc');
+        return { integrated, truth, ratio: integrated / truth };
+      })()
+    `, 120000);
+    check(
+      'g(r) в маленьком ящике согласована с перебором',
+      Math.abs(radialIntegrity.ratio - 1) < 0.03,
+      `интеграл ${radialIntegrity.integrated.toFixed(0)} против перебора ${radialIntegrity.truth}, ` +
+        `отношение ${radialIntegrity.ratio.toFixed(4)}`,
+    );
+
+    /* --- 21. Скриншот витрины --- */
     const shot = await client.send('Page.captureScreenshot', { format: 'png' });
     const { writeFileSync } = await import('node:fs');
     writeFileSync(resolve(SHOT_DIR, 'smoke.png'), Buffer.from(shot.data, 'base64'));

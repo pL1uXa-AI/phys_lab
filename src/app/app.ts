@@ -24,6 +24,7 @@ import {
 import { SceneRenderer } from '../render/scene.js';
 import { drawPlot, drawRadial, PLOT_COLORS } from '../render/plots.js';
 import { InputController } from '../input/controller.js';
+import { unprojectFromScreen, type BrushPlane } from '../core/integrator.js';
 import { AppState, format } from './state.js';
 import { h, need, setContent } from '../ui/dom.js';
 import { actionsPanel, presetsPanel, viewPanel, worldPanel, type PanelActions } from '../ui/panels.js';
@@ -72,6 +73,8 @@ export class App {
   private plotT!: HTMLCanvasElement;
   private plotE!: HTMLCanvasElement;
   private plotR!: HTMLCanvasElement;
+  private legendMin: HTMLElement | null = null;
+  private legendMax: HTMLElement | null = null;
   private presetHighlight: (id: string | null) => void = () => {};
 
   constructor(host: HTMLElement, app: Application) {
@@ -154,6 +157,7 @@ export class App {
       showWalls: this.state.view.showWalls,
       stepsPerFrame: this.state.stepsPerFrame,
       sampleRadial: this.state.sampleRadial,
+      autoSteps: this.state.autoSteps,
     });
     const presets = presetsPanel(actions, (id) => {
       this.state.presetId = id;
@@ -173,6 +177,9 @@ export class App {
       this.campaign.root,
     );
     this.bindings = { ...worldPanelResult.bindings, ...viewPanelResult.bindings };
+    // Подписи концов легенды: без чисел цвет частицы не связать с физикой.
+    this.legendMin = viewPanelResult.root.querySelector('[data-legend="min"]');
+    this.legendMax = viewPanelResult.root.querySelector('[data-legend="max"]');
 
     // Кнопки выбора инструмента — добавлены к панели «Воздействия».
     const toolRow = h('div', { class: 'row' });
@@ -315,6 +322,9 @@ export class App {
       setSampleRadial: (value) => {
         this.state.sampleRadial = value;
       },
+      setAutoSteps: (value) => {
+        this.state.autoSteps = value;
+      },
       applyPreset: (preset) => this.applyPreset(preset),
       heat: (factor) => this.world.scaleVelocities(factor),
       cool: (factor) => this.world.scaleVelocities(factor),
@@ -405,21 +415,36 @@ export class App {
     this.world.step();
     this.sampleIfDue(true);
     this.updateHud();
+    this.flashStepButton();
+  }
+
+  /**
+   * Вспышка кнопки «Шаг».
+   *
+   * Отклик на один шаг почти невидим: счётчик шагов меняется, но глазу за ним
+   * не уследить, и нажатие выглядит как «ничего не произошло». Короткая
+   * подсветка кнопки даёт понять, что шаг действительно сделан.
+   */
+  private flashStepButton(): void {
+    const btn = this.host.querySelector<HTMLButtonElement>('[data-action="step"]');
+    if (!btn) return;
+    btn.classList.add('btn--flash');
+    window.setTimeout(() => btn.classList.remove('btn--flash'), 180);
   }
 
   private poke(screenX: number, screenY: number, dx: number, dy: number): void {
     // Экранные координаты переводятся в координаты проекции, а толчок
-    // задаётся по всем трём осям: основной импульс — по направлению протяжки.
+    // задаётся по экранным осям: протяжка мышью идёт вдоль экрана.
     const scale = this.renderer.camera.scale;
     if (scale <= 0) return;
     const worldDx = (dx / scale) * this.input.pokeStrength;
     const worldDy = (dy / scale) * this.input.pokeStrength;
-    const [x, y, z] = this.unproject(screenX, screenY);
 
-    this.world.pokeNow({
-      x,
-      y,
-      z,
+    // Импульс НАКАПЛИВАЕТСЯ в мире и применяется один раз за кадр: за кадр
+    // мышь присылает несколько событий, и «последнее побеждает» сделало бы
+    // толчок зависимым от частоты событий устройства, а не от протяжки.
+    this.world.requestPoke({
+      plane: this.brushPlane(screenX, screenY),
       dx: worldDx,
       dy: worldDy,
       dz: 0,
@@ -429,33 +454,27 @@ export class App {
   }
 
   /**
-   * Обратная проекция точки плоскости экрана в мир.
+   * Кисть в мировых координатах: цилиндр вдоль оси взгляда через точку экрана.
    *
-   * Проекция была: поворот на yaw вокруг Y, затем наклон на pitch, затем
-   * отбрасывание z. Обратно восстанавливаем точку с z = 0, что даёт
-   * «плоскость экрана», проходящую через центр ящика. Этого достаточно:
-   * сфера захвата всё равно объёмная, и частицы за плоскостью тоже получат
-   * импульс.
+   * Вход — координаты ПРОЕКЦИИ (то, что даёт `camera.screenToWorld`), то есть
+   * система после поворота yaw/pitch. Раньше отсюда возвращалась одна точка
+   * на «плоскости экрана», и воздействие ограничивалось сферой вокруг неё:
+   * доступным оказывался только средний слой частиц. Теперь возвращается ось:
+   * точка на ней берётся в плоскости, проходящей через центр ящика, — так она
+   * остаётся внутри ящика, и минимальный образ работает корректно.
+   *
+   * Направление оси выводится из тех же углов, что и проекция (`World.project`),
+   * поэтому «куда смотрит камера» и «куда бьёт кисть» не могут разойтись.
    */
-  private unproject(px: number, py: number): [number, number, number] {
+  private brushPlane(screenX: number, screenY: number): BrushPlane {
     const center = this.world.box * 0.5;
-    const cosP = Math.cos(this.renderer.camera.pitch);
-    const sinP = Math.sin(this.renderer.camera.pitch);
-    const cosY = Math.cos(this.renderer.camera.yaw);
-    const sinY = Math.sin(this.renderer.camera.yaw);
-    // Обратные преобразования: сначала «снимаем» наклон, затем поворот.
-    const rz = -py / (sinP || 1e-6);
-    const rx = px;
-    const ry = py + rz * sinP;
-    const ax = rx * cosY + rz * sinY;
-    const az = -rx * sinY + rz * cosY;
-    void cosP;
-    return [ax + center, ry + center, az + center];
+    const w = this.world.viewAxis(this.renderer.camera.yaw, this.renderer.camera.pitch);
+    const p = unprojectFromScreen(w, screenX, screenY, 0);
+    return { w, center: { x: p.x + center, y: p.y + center, z: p.z + center } };
   }
 
   private freezeAt(px: number, py: number): void {
-    const [x, y, z] = this.unproject(px, py);
-    this.world.freezeRegion(x, y, z, this.input.brushRadius);
+    this.world.freezeRegion(this.brushPlane(px, py), this.input.brushRadius);
   }
 
   private unfreezeAt(_px: number, _py: number): void {
@@ -531,10 +550,24 @@ export class App {
       for (let i = 0; i < steps; i++) {
         this.world.step();
         this.tickSession();
-        this.sampleIfDue(false);
       }
       this.physicsMs = performance.now() - physicsStart;
+      // Кадр статистики g(r) считается ПОСЛЕ замера шага.
+      //
+      // Раньше он вызывался внутри цикла и попадал в `physicsMs`. Это ломало
+      // автоподстройку: она делила суммарное время на число шагов и получала
+      // завышенную «стоимость шага» — при 2048 частицах g(r) стоит примерно
+      // как шесть шагов, то есть замер был в разы больше правды, и число
+      // шагов на кадр уезжало к единице на здоровой системе.
+      this.sampleIfDue(false, steps);
       this.frameCounter++;
+    } else {
+      // Шагов физики в этом кадре не было (пауза или троттлинг частоты), а
+      // накопленный толчок мыши применить всё равно нужно: иначе на паузе
+      // протяжка не давала бы никакого отклика, и игрок не увидел бы, куда
+      // попал. Заявка ограничена одной на кадр, поэтому «тыканье» на паузе
+      // остаётся управляемым.
+      this.world.flushPoke();
     }
 
     const drawn = this.renderer.render(this.world, this.input.brush.active ? this.input.brush : null);
@@ -545,6 +578,7 @@ export class App {
       this.uiCounter = 0;
       this.updateHud();
       this.drawPlots();
+      this.updateLegendValues();
     }
     this.updateFps(frameStart);
     this.autoTuneSteps();
@@ -566,9 +600,9 @@ export class App {
   }
 
   /** Кадр статистики g(r) — дорого, поэтому не каждый шаг. */
-  private sampleIfDue(force: boolean): void {
+  private sampleIfDue(force: boolean, stepsTaken = 1): void {
     if (!this.state.sampleRadial && !force) return;
-    this.radialCounter++;
+    this.radialCounter += stepsTaken;
     if (force || this.radialCounter >= this.radialEvery) {
       this.radialCounter = 0;
       this.world.sampleRadial();
@@ -604,29 +638,39 @@ export class App {
    */
   private autoTuneSteps(): void {
     if (!this.state.autoSteps) return;
+    // Бюджет физики на кадр. При 8 шагах и цели 60 кадров/с это 10 мс —
+    // примерно шестая часть кадра, остальное достаётся отрисовке и браузеру.
     const budget = 10;
     const perStep = this.physicsMs / Math.max(1, this.state.stepsPerFrame);
     if (perStep <= 0 || !Number.isFinite(perStep)) return;
-    const frameStart = performance.now();
-    if (frameStart - this.lastAutoTune < 500) return;
-    this.lastAutoTune = frameStart;
+    const now = performance.now();
+    if (now - this.lastAutoTune < 500) return;
+    this.lastAutoTune = now;
 
     const ideal = Math.max(1, Math.min(40, Math.floor(budget / perStep)));
     if (ideal > this.state.stepsPerFrame && this.physicsMs < budget * 0.7) {
       this.state.stepsPerFrame++;
       this.bindings.stepsPerFrame?.set(this.state.stepsPerFrame);
+      this.state.notify();
     } else if (ideal < this.state.stepsPerFrame && this.physicsMs > budget) {
       this.state.stepsPerFrame = Math.max(1, this.state.stepsPerFrame - 1);
       this.bindings.stepsPerFrame?.set(this.state.stepsPerFrame);
+      this.state.notify();
     }
   }
 
   private updateFps(frameStart: number): void {
     const field = this.host.querySelector('[data-field="fps"]');
     if (!field) return;
+    void frameStart;
+    // На паузе «0 расч/с» читается как поломка, хотя это верное поведение.
+    // Показываем явное «пауза» вместо нуля.
+    if (this.paused) {
+      field.textContent = `пауза · шаг ${this.world.steps}`;
+      return;
+    }
     const total = this.physicsMs + this.drawMs;
     field.textContent = `${(1000 / Math.max(1, total)).toFixed(0)} расч/с · шаг ${this.world.steps}`;
-    void frameStart;
   }
 
   private updateHud(): void {
@@ -642,6 +686,8 @@ export class App {
       ['пик g(r)', format.value(this.world.orderPeak, 2)],
       ['время τ', format.time(this.world.time)],
       ['пар', format.int(this.world.pairCount)],
+      ['кадров g(r)', format.int(this.world.radial.sampleCount)],
+      ['подвижных', `${(m.mobileFraction * 100).toFixed(0)} %`],
     ];
     setContent(
       this.hud,
@@ -656,8 +702,35 @@ export class App {
     if (statsField) {
       statsField.textContent =
         `T* = ${format.value(m.temperature)}  ·  E = ${format.energy(m.total)}  ·  ` +
-        `${format.int(m.count)} частиц  ·  P* = ${format.value(m.pressure, 2)}`;
+        `${format.int(m.count)} частиц  ·  P* = ${format.value(m.pressure, 2)}` +
+        this.equilibriumLabel();
     }
+  }
+
+  /**
+   * Готова ли статистика: набралось ли достаточно кадров g(r).
+   *
+   * Смысл — не дать игроку поверить цифрам, которые ещё «плывут». Один кадр
+   * g(r) шумный, а у больших систем ещё и дорогой, поэтому приложение
+   * сознательно растягивает интервал. Пока кадров мало, кривая не готова, и
+   * об этом нужно сказать прямо, а не оставлять игрока догадываться.
+   */
+  private equilibriumLabel(): string {
+    // Выключенный сбор g(r) — не «выход на режим», а сознательный выбор
+    // игрока: в этом режиме статистики не будет вообще, и обещать прогресс
+    // нельзя. Показываем прочерк, а не вечные 0 %.
+    if (!this.state.sampleRadial) return '';
+    const samples = this.world.radial.sampleCount;
+    if (this.world.params.thermostat === 'none') {
+      // Без термостата «равновесие» = сохранение энергии, а не выход на T*.
+      return samples < 20 ? '  ·  набор статистики' : '';
+    }
+    const target = this.world.params.temperature;
+    const current = this.world.measurement.temperature;
+    const settled = Math.abs(current - target) < Math.max(0.05, target * 0.08);
+    if (!settled) return `  ·  выход на режим (T* ${current.toFixed(2)} → ${target.toFixed(2)})`;
+    if (samples < 20) return `  ·  набор статистики (${samples}/20)`;
+    return '  ·  равновесие';
   }
 
   private syncControls(): void {
@@ -666,6 +739,30 @@ export class App {
     this.bindings.count?.set(this.world.state.count);
     this.bindings.thermostat?.set(this.world.params.thermostat);
     this.bindings.boundary?.set(this.world.params.boundary);
+  }
+
+  /**
+   * Подписи концов легенды: во что превращается шкала 0…1 в текущей раскраске.
+   *
+   * Легенда обязана объяснять не только «от синего к красному», но и что
+   * именно измеряется: без чисел «мин / макс» игрок не может связать цвет
+   * с физической величиной (сообщение из отзыва: «не понятно, что за цвета
+   * у частиц, что на них влияет»). Диапазон берётся из того же
+   * `world.colorValues`, которым пользуется рендер, поэтому разойтись они
+   * не могут.
+   */
+  private updateLegendValues(): void {
+    if (!this.legendMin || !this.legendMax) return;
+    const { min, max } = this.world.colorValues(this.state.view.colorMode);
+    const mode = this.state.view.colorMode;
+    const unit = mode === 'speed' ? 'σ/τ' : mode === 'travel' ? 'σ' : '';
+    const text = (value: number): string => {
+      if (mode === 'plain') return '—';
+      const digits = Math.abs(value) >= 100 ? 0 : Math.abs(value) >= 10 ? 1 : 2;
+      return unit ? `${value.toFixed(digits)} ${unit}` : value.toFixed(digits);
+    };
+    this.legendMin.textContent = text(min);
+    this.legendMax.textContent = text(max);
   }
 
   /** Отрисовка всех трёх графиков. */

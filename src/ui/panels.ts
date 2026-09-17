@@ -31,6 +31,7 @@ export interface PanelActions {
   setShowWalls(value: boolean): void;
   setStepsPerFrame(value: number): void;
   setSampleRadial(value: boolean): void;
+  setAutoSteps(value: boolean): void;
   applyPreset(preset: Preset): void;
   heat(factor: number): void;
   cool(factor: number): void;
@@ -92,7 +93,12 @@ export function worldPanel(actions: PanelActions, initial: {
   lattice: LatticeKind;
 }): { root: HTMLElement; bindings: Partial<ControlBindings> } {
   const temperature = rangeControl({
-    label: 'Температура T*',
+    // «(цель)» — не украшение. Ползунок задаёт ЦЕЛЕВУЮ температуру термостата,
+    // а не мгновенную: при выключенном термостате они вообще не связаны, а при
+    // включённом сходятся только после выхода на режим. Без этого уточнения
+    // ползунок читается как «показание», и возникает законный вопрос, почему
+    // он не совпадает с T* в сводке.
+    label: 'Целевая температура T*',
     min: 0.05,
     max: 3,
     step: 0.05,
@@ -101,6 +107,8 @@ export function worldPanel(actions: PanelActions, initial: {
     onInput: actions.setTemperature,
   });
   const density = rangeControl({
+    // Плотность — параметр системы, а не мгновенное измерение: ρ* = N/V
+    // задаётся ящиком и совпадает с фактической точно (это проверяется тестом).
     label: 'Плотность ρ*',
     min: 0.05,
     max: 1.3,
@@ -110,7 +118,9 @@ export function worldPanel(actions: PanelActions, initial: {
     onInput: actions.setDensity,
   });
   const count = rangeControl({
-    label: 'Число частиц',
+    // ГЦК-решётка округляет число до 4n³, поэтому фактическое число частиц
+    // может отличаться от положения ползунка — фактическое видно в сводке.
+    label: 'Число частиц (до 4n³)',
     min: 128,
     max: 20000,
     step: 128,
@@ -247,15 +257,12 @@ export function viewPanel(actions: PanelActions, initial: {
   showWalls: boolean;
   stepsPerFrame: number;
   sampleRadial: boolean;
+  autoSteps: boolean;
 }): { root: HTMLElement; legend: HTMLElement; bindings: Partial<ControlBindings> } {
   const legendRamp = h('div', { class: 'legend__ramp' });
-  const legend = h(
-    'div',
-    { class: 'legend' },
-    h('span', {}, 'мин'),
-    legendRamp,
-    h('span', {}, 'макс'),
-  );
+  const legendMin = h('span', { class: 'legend__bound', dataset: { legend: 'min' } }, '—');
+  const legendMax = h('span', { class: 'legend__bound', dataset: { legend: 'max' } }, '—');
+  const legend = h('div', { class: 'legend' }, legendMin, legendRamp, legendMax);
 
   function updateLegend(mode: string): void {
     const stops = legendStops(mode, 5);
@@ -299,14 +306,28 @@ export function viewPanel(actions: PanelActions, initial: {
     legend,
     particleScale.root,
     stepsPerFrame.root,
+    checkbox({
+      label: 'Подстраивать шаги автоматически',
+      checked: initial.autoSteps,
+      onChange: actions.setAutoSteps,
+    }),
     checkbox({ label: 'Тени глубины', checked: initial.depthShading, onChange: actions.setDepthShading }),
     checkbox({ label: 'Стенки ящика', checked: initial.showWalls, onChange: actions.setShowWalls }),
     checkbox({ label: 'Считать g(r)', checked: initial.sampleRadial, onChange: actions.setSampleRadial }),
     h(
       'p',
       { class: 'hint' },
-      'Мышь: тянуть — толкать частицы, колесо — масштаб, правая кнопка — поворот, ' +
-        'Shift+колесо — сдвиг камеры.',
+      'Цвет — это величина из раскраски (легенда показывает её диапазон на шкале от ' +
+        'минимума к максимуму). «Скорость»: синие частицы медленные, красные быстрые. ' +
+        '«Плотность»: тусклые — мало соседей, оранжевые — много. ' +
+        '«Смещение»: тёмные сидят на месте, светлые уехали далеко.',
+    ),
+    h(
+      'p',
+      { class: 'hint' },
+      'Мышь: тянуть — толкать частицы (кисть бьёт цилиндром вдоль луча зрения, ' +
+        'поэтому задевает частицы на любой глубине), колесо — масштаб, ' +
+        'правая кнопка — поворот, Shift+тянуть — сдвиг камеры.',
     ),
   );
 

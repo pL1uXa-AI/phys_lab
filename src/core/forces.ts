@@ -727,6 +727,102 @@ export function computeForcesFromList(
 }
 
 /**
+ * Силы прямым перебором всех пар: O(N²), но без единого предположения о сетке.
+ *
+ * ─── Зачем нужен отдельный путь ──────────────────────────────────────────
+ *
+ * Сетка ячеек корректна только тогда, когда её ячейка не меньше радиуса
+ * поиска `rc + кожа`. В маленьком ящике (мало частиц и/или высокая плотность)
+ * `n = max(3, floor(box / size))` даёт ячейку меньше радиуса, сосед уходит
+ * «через одну» ячейку, и часть пар теряется — причём молча: силы просто не
+ * считаются, и система «остывает». Измерено: N = 256, ρ* = 1.3 теряли 4.5 %
+ * пар при ячейке 1.94σ вместо требуемых 2.9σ.
+ *
+ * Поэтому мир, убедившись, что сетка слишком грубая, вызывает эту функцию.
+ * Стоимость O(N²) здесь приемлема: путь включается только на системах, где
+ * N мало (при ρ* = 1.3 сетка становится безопасной примерно с N ≈ 900),
+ * а корректность физики важнее скорости.
+ *
+ * @param countNeighbours считать ли локальную плотность (для раскраски)
+ */
+export function computeForcesDirect(
+  state: ParticleState,
+  box: number,
+  cutoff: number,
+  shift: LjShift,
+  periodic: boolean,
+  countNeighbours = true,
+): ForceStats {
+  const x = state.x;
+  const y = state.y;
+  const z = state.z;
+  const fx = state.fx;
+  const fy = state.fy;
+  const fz = state.fz;
+  const neighbours = state.neighbours;
+
+  fx.fill(0);
+  fy.fill(0);
+  fz.fill(0);
+  if (countNeighbours) neighbours.fill(0);
+
+  const cutoffSq = cutoff * cutoff;
+  const half = box * 0.5;
+  const invBox = 1 / box;
+  const shiftForce = shift.forceOverR;
+  const halfShift = 0.5 * shiftForce;
+  const energyConstant = shift.energy + halfShift * shift.cutoffSq;
+
+  let potential = 0;
+  let virial = 0;
+  let pairs = 0;
+
+  for (let i = 0; i < state.count; i++) {
+    const xi = x[i];
+    const yi = y[i];
+    const zi = z[i];
+    for (let j = i + 1; j < state.count; j++) {
+      let dx = x[j] - xi;
+      let dy = y[j] - yi;
+      let dz = z[j] - zi;
+      if (periodic) {
+        // Координаты лежат в [0, box), но после заморозки и внешних сдвигов
+        // это не гарантировано, поэтому минимальный образ через round,
+        // а не через одну поправку.
+        dx -= box * Math.round(dx * invBox);
+        dy -= box * Math.round(dy * invBox);
+        dz -= box * Math.round(dz * invBox);
+      }
+      const r2 = dx * dx + dy * dy + dz * dz;
+      if (r2 >= cutoffSq || r2 === 0) continue;
+      const inv2 = 1 / r2;
+      const inv6 = inv2 * inv2 * inv2;
+      const inv12 = inv6 * inv6;
+      const foR = 24 * (2 * inv12 - inv6) * inv2 - shiftForce;
+      const rx = foR * dx;
+      const ry = foR * dy;
+      const rz = foR * dz;
+      fx[i] -= rx;
+      fy[i] -= ry;
+      fz[i] -= rz;
+      fx[j] += rx;
+      fy[j] += ry;
+      fz[j] += rz;
+      potential += 4 * (inv12 - inv6) + halfShift * r2 - energyConstant;
+      virial += rx * dx + ry * dy + rz * dz;
+      pairs++;
+      if (countNeighbours && r2 < NEIGHBOUR_RADIUS_SQ) {
+        neighbours[i]++;
+        neighbours[j]++;
+      }
+    }
+  }
+
+  void half;
+  return { potential, virial, pairs };
+}
+
+/**
  * Сила, действующая на частицу i со стороны частицы j.
  *
  * Возвращается именно сила НА i: d направлен от i к j, поэтому F_i = −(F/r)·d.

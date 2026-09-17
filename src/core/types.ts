@@ -81,20 +81,9 @@ export const DEFAULT_PARAMS: WorldParams = {
   friction: 0.5,
 };
 
-/**
- * Шаг сетки для списков Верле. Должен быть не меньше радиуса обрезания,
- * иначе часть соседей потеряется; берём с запасом.
- */
-export const CELL_SIZE_FACTOR = 1.05;
-
 /** Длина ящика из числа частиц и плотности: L = (N/ρ)^(1/3). */
 export function boxLength(count: number, density: number): number {
   return Math.cbrt(count / density);
-}
-
-/** Плотность из длины ящика: ρ = N / L³. */
-export function densityOf(count: number, box: number): number {
-  return count / (box * box * box);
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +199,12 @@ export interface CellGrid {
   counts: Int32Array;
 }
 
-/** Создание сетки под ящик `box` и размер ячейки `cellSize`. */
+/**
+ * Создание сетки под ящик `box` и размер ячейки `cellSize`.
+ *
+ * Используется тестами; сам мир строит сетку в `World.makeGrid`, где
+ * дополнительно проверяется, что ячейка не меньше радиуса поиска.
+ */
 export function allocGrid(box: number, cellSize: number): CellGrid {
   const n = Math.max(1, Math.floor(box / cellSize));
   const cells = n * n * n;
@@ -222,22 +216,6 @@ export function allocGrid(box: number, cellSize: number): CellGrid {
     cellIndex: new Int32Array(0),
     counts: new Int32Array(cells),
   };
-}
-
-/** Выравнивание сетки под новое число частиц. Массивы увеличиваются при нужде. */
-export function resizeGrid(grid: CellGrid, box: number, cellSize: number, count: number): void {
-  const n = Math.max(1, Math.floor(box / cellSize));
-  if (n !== grid.n) {
-    const cells = n * n * n;
-    grid.n = n;
-    grid.size = box / n;
-    grid.cellStart = new Int32Array(cells + 1);
-    grid.counts = new Int32Array(cells);
-  }
-  if (grid.order.length !== count) {
-    grid.order = new Int32Array(count);
-    grid.cellIndex = new Int32Array(count);
-  }
 }
 
 // ---------------------------------------------------------------------------
