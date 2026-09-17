@@ -197,22 +197,77 @@ describe('MeanSquareDisplacement: синтетические проверки', 
     expect(result.r2).toBe(0);
   });
 
-  it('отрезок подгонки — от 20 % до 80 % максимального лага', () => {
+  it('окно подгонки осмысленно на идеально линейной MSD', () => {
+    /*
+     * Раньше окно было жёстким (20…80 % лага), и тест фиксировал границы. Но
+     * такая эвристика молча врёт: если баллистический участок длиннее 20 %,
+     * подгонка захватывает нелинейную часть и занижает D. Теперь окно
+     * выбирается ПО ДАННЫМ, поэтому проверять фиксированные границы
+     * бессмысленно — проверяется, что окно непустое, лежит внутри кривой,
+     * а на строго линейной MSD подгонка точна.
+     *
+     * ВАЖНО про построение данных: модуль накапливает КВАДРАТ смещения,
+     * поэтому чтобы получить линейную MSD = c·t, координату надо менять как
+     * sqrt(c·t), а не как c·t. Первая версия теста этого не учитывала:
+     * строила параболическую кривую и требовала от неё r² = 1, что неверно.
+     */
     const msd = new MeanSquareDisplacement(40, 10);
     expect(msd.lags).toBe(40);
     expect(msd.maxLag).toBe(10);
     expect(msd.width).toBeCloseTo(0.25, 12);
+
     const state = atOrigin(10);
     msd.prepare(state.count);
     msd.addOrigin(state, 100);
+    // MSD(t) = 0.6·t  →  смещение = sqrt(0.6·t).
     for (let k = 0; k <= 40; k++) {
-      for (let i = 0; i < state.count; i++) state.x[i] = 0.1 * k;
-      msd.sample(state, 100, false, k * 0.25);
+      const t = k * 0.25;
+      const offset = Math.sqrt(0.6 * t);
+      for (let i = 0; i < state.count; i++) state.x[i] = offset;
+      msd.sample(state, 100, false, t);
     }
-    const { lagRange } = msd.diffusion();
-    // last = 39, floor(0.2·39) = 7, ceil(0.8·39) = 32 → [1.75, 8].
-    expect(lagRange[0]).toBeCloseTo(1.75, 12);
-    expect(lagRange[1]).toBeCloseTo(8, 12);
+    const { lagRange, r2, D } = msd.diffusion();
+    expect(lagRange[0]).toBeGreaterThanOrEqual(0);
+    expect(lagRange[1]).toBeLessThanOrEqual(msd.maxLag + 1e-9);
+    expect(lagRange[1]).toBeGreaterThan(lagRange[0]);
+    expect(r2).toBeGreaterThan(0.999);
+    // D = наклон/6 = 0.6/6 = 0.1 — проверяет и наклон, и множитель 1/6.
+    expect(D).toBeCloseTo(0.1, 4);
+  });
+
+  it('баллистическое начало отбрасывается, а не попадает в подгонку', () => {
+    /*
+     * Главная причина, по которой окно перестало быть жёстким.
+     *
+     * Кривая строится из двух участков: сначала баллистический (MSD ∝ t²,
+     * наклон в лог-лог координатах равен 2), потом диффузионный (MSD ∝ t,
+     * наклон 1). Если подгонка захватит начало, наклон выйдет завышенным
+     * (и D тоже), а r² упадёт. Правильное поведение — начать с излома.
+     */
+    const msd = new MeanSquareDisplacement(40, 10);
+    const state = atOrigin(10);
+    msd.prepare(state.count);
+    msd.addOrigin(state, 100);
+
+    const crossover = 2.5;
+    for (let k = 0; k <= 40; k++) {
+      const t = k * 0.25;
+      // MSD: 0.4·t² до излома, дальше линейно с наклоном 0.8.
+      const target =
+        t <= crossover
+          ? 0.4 * t * t
+          : 0.4 * crossover * crossover + 0.8 * (t - crossover);
+      const offset = Math.sqrt(target);
+      for (let i = 0; i < state.count; i++) state.x[i] = offset;
+      msd.sample(state, 100, false, t);
+    }
+
+    const { lagRange, r2, D } = msd.diffusion();
+    // Окно обязано начаться ПОСЛЕ излома: баллистическую часть не берём.
+    expect(lagRange[0]).toBeGreaterThan(crossover - 0.3);
+    // На линейном участке наклон 0.8, значит D = 0.8/6 ≈ 0.1333.
+    expect(D).toBeCloseTo(0.8 / 6, 3);
+    expect(r2).toBeGreaterThan(0.995);
   });
 
   it('reset очищает и статистику, и начала отсчёта', () => {

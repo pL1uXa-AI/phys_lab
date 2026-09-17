@@ -1340,6 +1340,39 @@ export class App {
         structurePeakK: this.world.structure.firstPeak().k,
       }),
       boxLength: (count: number, density: number) => boxLength(count, density),
+      /**
+       * Разбивка времени кадра.
+       *
+       * Замеры уже ведутся для автоподстройки шагов, но наружу не выводились,
+       * а без них нельзя ответить на вопрос «что именно тормозит»: физика,
+       * отрисовка или статистика. Гадать об этом бессмысленно — стоимость
+       * рендера связей растёт вместе с числом частиц и вполне может
+       * перевесить расчёт сил.
+       */
+      timings: () => ({
+        physicsMs: this.physicsMs,
+        drawMs: this.drawMs,
+        stepsPerFrame: this.state.stepsPerFrame,
+        bondsDrawn: this.renderer.bondStatsSnapshot.drawn,
+      }),
+      /**
+       * Замер отрисовки в отрыве от физики: N отрисовок подряд.
+       *
+       * Нужен, чтобы отделить стоимость рендера от стоимости шага. В обычном
+       * цикле они перемешаны, и по `frameMs` нельзя понять, что оптимизировать.
+       */
+      measureDraw: (frames: number) => {
+        let particles = 0;
+        let bonds = 0;
+        let total = 0;
+        for (let i = 0; i < frames; i++) {
+          const stats = this.renderer.render(this.world, null);
+          total += stats.frameMs;
+          particles = stats.drawn;
+        }
+        bonds = this.renderer.bondStatsSnapshot.drawn;
+        return { msPerFrame: total / Math.max(1, frames), particles, bonds };
+      },
     };
   }
 }
@@ -1438,4 +1471,8 @@ export interface PhysLabApi {
     structurePeakK: number;
   };
   boxLength(count: number, density: number): number;
+  /** Разбивка времени кадра: физика, отрисовка, число шагов. */
+  timings(): { physicsMs: number; drawMs: number; stepsPerFrame: number; bondsDrawn: number };
+  /** Замер только отрисовки, без шагов физики. */
+  measureDraw(frames: number): { msPerFrame: number; particles: number; bonds: number };
 }
