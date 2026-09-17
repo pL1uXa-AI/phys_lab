@@ -20,6 +20,7 @@
  */
 
 import { computeForcesDirect, computeForcesFromList, type ForceStats } from './forces.js';
+import { BondNetwork } from './bonds.js';
 import { DEFAULT_SKIN, VerletList } from './neighbours.js';
 import { buildGrid, cellSizeFor } from './grid.js';
 import {
@@ -237,6 +238,18 @@ export class World {
 
   readonly history = new History();
   readonly radial = new RadialDistribution(3.5, 140);
+
+  /**
+   * Сеть связей ближних соседей — то, из чего рисуется «структура».
+   *
+   * Строится ЛЕНИВО: только когда её кто-то спросит (рендер при включённом
+   * слое связей, интерфейс для координационного числа). Считать её каждый
+   * шаг «на всякий случай» — это лишний обход всех пар на каждой итерации,
+   * а нужна она раз в кадр отрисовки.
+   */
+  readonly bonds = new BondNetwork();
+  /** Изменились ли координаты с последнего построения сети связей. */
+  private bondsStale = true;
 
   /** Накопленное время симуляции в единицах τ. */
   time = 0;
@@ -533,6 +546,9 @@ export class World {
 
     this.time += dt;
     this.steps++;
+    // Координаты изменились — сеть связей устарела. Пересобирать её здесь
+    // нельзя: она нужна не каждый шаг, а раз в кадр отрисовки.
+    this.bondsStale = true;
 
     // 6. Замер и проверка на нечисловой мусор (NaN/Infinity).
     //
@@ -753,6 +769,7 @@ export class World {
     this.lastPeak = 0;
     this.history.clear();
     this.radial.reset();
+    this.bondsStale = true;
   }
 
   /**
@@ -770,6 +787,9 @@ export class World {
     this.verlet.resize(this.state.count);
     this.radial.reset();
     this.history.clear();
+    // Геометрия изменилась: сетка связей привязана к ящику и обязана
+    // пересобраться, иначе она будет ссылаться на старые границы ячеек.
+    this.bondsStale = true;
     this.rebuildForces();
     this.current = this.measureNow();
     this.history.push(this.makeSample());
@@ -1001,6 +1021,33 @@ export class World {
   /** Готовая функция g(r). */
   radialDistribution(): { r: Float64Array; g: Float64Array } {
     return this.radial.result(this.box);
+  }
+
+  /**
+   * Сеть связей ближних соседей на текущий момент.
+   *
+   * Пересобирается только если координаты менялись после прошлого построения.
+   * Благодаря этому её можно звать каждый кадр отрисовки (и даже несколько
+   * раз) без лишней работы, а выключенный слой связей не стоит ничего.
+   *
+   * @param radius радиус связи в σ; `undefined` — оставить текущий
+   */
+  bondNetwork(radius?: number): BondNetwork {
+    if (radius !== undefined) {
+      this.bonds.setCutoff(radius);
+      this.bondsStale = true;
+    }
+    if (this.bondsStale) {
+      this.bonds.build(this.state, this.box, this.params.boundary === 'periodic');
+      this.bondsStale = false;
+    }
+    return this.bonds;
+  }
+
+  /** Среднее координационное число (число связей на частицу). */
+  get coordination(): number {
+    const net = this.bondNetwork();
+    return net.meanCoordination(this.state);
   }
 
   /**

@@ -29,6 +29,10 @@ export interface PanelActions {
   setParticleScale(value: number): void;
   setDepthShading(value: boolean): void;
   setShowWalls(value: boolean): void;
+  setShowBonds(value: boolean): void;
+  setBondRadius(value: number): void;
+  setShowTrails(value: boolean): void;
+  setShowVectors(value: boolean): void;
   setStepsPerFrame(value: number): void;
   setSampleRadial(value: boolean): void;
   setAutoSteps(value: boolean): void;
@@ -255,6 +259,10 @@ export function viewPanel(actions: PanelActions, initial: {
   particleScale: number;
   depthShading: boolean;
   showWalls: boolean;
+  showBonds: boolean;
+  bondRadius: number;
+  showTrails: boolean;
+  showVectors: boolean;
   stepsPerFrame: number;
   sampleRadial: boolean;
   autoSteps: boolean;
@@ -289,6 +297,15 @@ export function viewPanel(actions: PanelActions, initial: {
     format: (v) => `${v.toFixed(1)}×`,
     onInput: actions.setParticleScale,
   });
+  const bondRadius = rangeControl({
+    label: 'Радиус связи, σ',
+    min: 1.15,
+    max: 2.2,
+    step: 0.05,
+    value: initial.bondRadius,
+    format: (v) => v.toFixed(2),
+    onInput: actions.setBondRadius,
+  });
   const stepsPerFrame = rangeControl({
     label: 'Шагов за кадр',
     min: 1,
@@ -305,6 +322,14 @@ export function viewPanel(actions: PanelActions, initial: {
     colorMode.root,
     legend,
     particleScale.root,
+    checkbox({
+      label: 'Связи ближних соседей',
+      checked: initial.showBonds,
+      onChange: actions.setShowBonds,
+    }),
+    bondRadius.root,
+    checkbox({ label: 'Шлейфы траекторий', checked: initial.showTrails, onChange: actions.setShowTrails }),
+    checkbox({ label: 'Векторы скоростей', checked: initial.showVectors, onChange: actions.setShowVectors }),
     stepsPerFrame.root,
     checkbox({
       label: 'Подстраивать шаги автоматически',
@@ -314,6 +339,13 @@ export function viewPanel(actions: PanelActions, initial: {
     checkbox({ label: 'Тени глубины', checked: initial.depthShading, onChange: actions.setDepthShading }),
     checkbox({ label: 'Стенки ящика', checked: initial.showWalls, onChange: actions.setShowWalls }),
     checkbox({ label: 'Считать g(r)', checked: initial.sampleRadial, onChange: actions.setSampleRadial }),
+    h(
+      'p',
+      { class: 'hint' },
+      '«Связи» соединяют атомы, стоящие ближе выбранного радиуса: у кристалла ' +
+        'выходит правильная решётка (12 связей на атом), у жидкости — рвущаяся сетка, ' +
+        'у газа линий почти нет. Это самый быстрый способ увидеть разницу фаз.',
+    ),
     h(
       'p',
       { class: 'hint' },

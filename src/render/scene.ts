@@ -8,6 +8,10 @@
  * в типизированных буферах, поэтому 10 000 частиц рисуются за один вызов.
  * Текстура кружка печётся один раз, цвет задаётся через `tint`.
  *
+ * Поверх частиц рисуются связи ближних соседей — тем же `ParticleContainer`,
+ * но с текстурой отрезка. Это не украшение: без связей кристалл и жидкость
+ * выглядят одинаково, россыпью кружков, и структура не читается вовсе.
+ *
  * ─── Что важно помнить про этот API ──────────────────────────────────────
  *
  *   1. У `Particle` НЕТ свойства `visible` и НЕТ `scale`/`alpha` как у
@@ -15,7 +19,9 @@
  *      можно только нулевым масштабом или прозрачностью — что мы и делаем.
  *   2. Список `dynamicProperties` задаёт, какие атрибуты пересчитываются
  *      каждый кадр. Если включить лишние, платим за них; если забыть нужный
- *      (например, `color`), частицы «застынут» в первом цвете.
+ *      (например, `color`), частицы «застынут» в первом цвете. Связям
+ *      обязателен ещё и `rotation`: без него все отрезки останутся
+ *      горизонтальными, и решётка превратится в штриховку.
  *   3. Глубина (координата z после поворота) управляет размером и
  *      прозрачностью: дальние частицы меньше и бледнее. Это даёт ощущение
  *      объёма без настоящей перспективной матрицы.
@@ -31,7 +37,9 @@ import {
 import type { ColorMode } from '../core/types.js';
 import type { World } from '../core/world.js';
 import { Camera } from './camera.js';
-import { colorFor, FROZEN_COLOR, WALL_COLOR } from './palette.js';
+import { LineLayer, MAX_SEGMENTS } from './lines.js';
+import { colorFor, BOND_COLOR, FROZEN_COLOR, TRAIL_COLOR, WALL_COLOR } from './palette.js';
+import { SegmentBuffer, TrailBuffer } from './trails.js';
 
 /** Максимальное число частиц в буфере проекции. */
 const MAX_PROJECTED = 60000;
@@ -41,6 +49,9 @@ const DRAW_LIMIT = 40000;
 
 /** Радиус кружка в текстуре (пиксели). */
 const TEXTURE_SIZE = 32;
+
+/** Цвет векторов скоростей. */
+const VECTOR_COLOR = '#e8d9a0';
 
 /** Результат одного кадра отрисовки. */
 export interface RenderStats {
@@ -55,6 +66,26 @@ export interface RenderOptions {
   particleScale: number;
   depthShading: boolean;
   brushRadius: number;
+  /** Рисовать ли связи ближних соседей. */
+  showBonds: boolean;
+  /** Радиус связи в единицах σ. */
+  bondRadius: number;
+  /** Связи поверх частиц (true) или под ними (false). */
+  bondsOnTop: boolean;
+  /** Рисовать ли шлейфы траекторий меченых частиц. */
+  showTrails: boolean;
+  /** Рисовать ли векторы скоростей. */
+  showVectors: boolean;
+  /** Длина шлейфа в кадрах записи. */
+  trailLength: number;
+}
+
+/** Статистика слоя связей — для интерфейса и проверок. */
+export interface BondRenderStats {
+  /** Сколько связей нарисовано в последнем кадре. */
+  drawn: number;
+  /** Упёрлись ли в потолок числа спрайтов. */
+  truncated: boolean;
 }
 
 /** Сцена: частицы и служебный слой. */
@@ -68,15 +99,33 @@ export class SceneRenderer {
     particleScale: 1,
     depthShading: true,
     brushRadius: 3,
+    showBonds: true,
+    bondRadius: 1.45,
+    bondsOnTop: false,
+    showTrails: true,
+    showVectors: false,
+    trailLength: 60,
   };
 
   private particles!: ParticleContainer;
+  private bondLayer!: LineLayer;
+  private trailLayer!: LineLayer;
+  private vectorLayer!: LineLayer;
   private overlay!: Graphics;
   private readonly sprites: Particle[] = [];
+
+  /** Буфер траекторий меченых частиц. */
+  readonly trails = new TrailBuffer();
+  /** Переиспользуемый буфер отрезков — чтобы не создавать мусор каждый кадр. */
+  private readonly scratch = new SegmentBuffer(16384);
+  /** Сколько частиц помечено на момент последней записи. */
+  private markedFor = -1;
+
   private texture!: Texture;
   private projected = new Float32Array(MAX_PROJECTED * 3);
   private allocated = 0;
   private lastDrawn = 0;
+  private bondStats: BondRenderStats = { drawn: 0, truncated: false };
 
   constructor(app: Application) {
     this.app = app;
@@ -106,7 +155,18 @@ export class SceneRenderer {
       // Если забыть `color`, частицы останутся в цвете первого кадра.
       dynamicProperties: { position: true, vertex: true, color: true },
     });
+
+    this.bondLayer = new LineLayer();
+    this.trailLayer = new LineLayer();
+    this.vectorLayer = new LineLayer();
+
+    // Порядок важен: связи и шлейфы рисуются ПОД частицами, иначе они
+    // перекрывают атомы, и вместо решётки получается сетка поверх кружков.
+    // Векторы скоростей, наоборот, идут ПОВЕРХ — они должны читаться.
+    this.app.stage.addChild(this.bondLayer.view);
+    this.app.stage.addChild(this.trailLayer.view);
     this.app.stage.addChild(this.particles);
+    this.app.stage.addChild(this.vectorLayer.view);
   }
 
   /** Подгонка камеры под ящик при изменении размера области просмотра. */
@@ -198,9 +258,216 @@ export class SceneRenderer {
     for (let i = count; i < this.allocated; i++) this.sprites[i].alpha = 0;
     this.lastDrawn = drawn;
 
+    this.recordTrails(world);
+    this.drawBonds(world);
+    this.drawTrails(world);
+    this.drawVectors(world);
     this.drawOverlay(world, brush);
 
     return { drawn, frameMs: performance.now() - started };
+  }
+
+  /**
+   * Проекция абсолютной мировой точки в экранные пиксели.
+   *
+   * В отличие от `world.project`, который считает сразу все частицы в общий
+   * буфер, здесь точка одна. Формула поворота обязана совпадать с
+   * `World.project` до последнего знака: иначе линии разъедутся с частицами.
+   */
+  private projectWorld(world: World, x: number, y: number, z: number): { x: number; y: number } {
+    const center = world.box * 0.5;
+    const ax = x - center;
+    const ay = y - center;
+    const az = z - center;
+    const cosY = Math.cos(this.camera.yaw);
+    const sinY = Math.sin(this.camera.yaw);
+    const cosP = Math.cos(this.camera.pitch);
+    const sinP = Math.sin(this.camera.pitch);
+    const rx = ax * cosY - az * sinY;
+    const rz = ax * sinY + az * cosY;
+    const ry = ay * cosP - rz * sinP;
+    return this.camera.worldToScreen(rx, ry);
+  }
+
+  /** Текущий масштаб и толщина линий — общие для всех слоёв. */
+  private lineThickness(base: number): number {
+    return Math.max(1, base * this.camera.scale * 0.12 * this.options.particleScale);
+  }
+
+  /**
+   * Запись положений меченых частиц в кольцевой буфер траекторий.
+   *
+   * Меченые частицы выбираются заново при смене числа частиц (пересборка
+   * мира, смена числа в панели): иначе индексы указывали бы на несуществующие
+   * атомы. Проверка дешёвая — сравнение с числом, записанным в прошлый раз.
+   */
+  private recordTrails(world: World): void {
+    const count = world.state.count;
+    if (count !== this.markedFor) {
+      this.trails.markEvenly(count);
+      this.markedFor = count;
+    }
+    if (!this.options.showTrails) {
+      this.trails.clear();
+      return;
+    }
+    this.trails.record(world.state.x, world.state.y, world.state.z, world.state.alive);
+  }
+
+  /**
+   * Слой связей ближних соседей.
+   *
+   * ─── Зачем он нужен ──────────────────────────────────────────────────────
+   *
+   * Связи превращают «россыпь кружков» в структуру: у кристалла видна
+   * решётка, у жидкости — рвущаяся сетка, у газа линий нет вовсе. Без этого
+   * слоя кристалл и жидкость на экране почти неотличимы.
+   *
+   * ─── Почему через вектор, а не через концы ───────────────────────────────
+   *
+   * Ядро хранит для каждой связи вектор с МИНИМАЛЬНЫМ ОБРАЗОМ. Это важно:
+   * у периодических границ сосед может стоять у противоположной стенки, и
+   * прямая линия между абсолютными координатами пересекла бы весь ящик.
+   * Минимальный образ даёт короткий правильный отрезок.
+   */
+  private drawBonds(world: World): void {
+    if (!this.options.showBonds) {
+      this.bondLayer.hideAll();
+      this.bondStats = { drawn: 0, truncated: false };
+      return;
+    }
+
+    const net = world.bondNetwork(this.options.bondRadius);
+    const total = Math.min(net.pairCount, MAX_SEGMENTS);
+    const buffer = this.scratch;
+    buffer.count = 0;
+
+    const alive = world.state.alive;
+    const x = world.state.x;
+    const y = world.state.y;
+    const z = world.state.z;
+
+    for (let k = 0; k < total; k++) {
+      const i = net.a[k];
+      const j = net.b[k];
+      if (alive[i] === 0 || alive[j] === 0) continue;
+      /*
+       * Конец отрезка — это положение соседа В ТОМ ЖЕ периодическом образе,
+       * что и частица i. Вектор из ядра уже взят с минимальным образом,
+       * поэтому прибавление его к координате i даёт соседа «рядом», а не
+       * через стенку ящика. Поворот применит `projectWorld` — дублировать
+       * его здесь не нужно и опасно: две формулы легко разойдутся.
+       */
+      if (!buffer.push(x[i], y[i], z[i], x[i] + net.dx[k], y[i] + net.dy[k], z[i] + net.dz[k], false)) {
+        break;
+      }
+    }
+
+    const drawn = this.bondLayer.draw(buffer, {
+      color: BOND_COLOR,
+      thickness: this.lineThickness(1.6),
+      alpha: 0.9,
+      project: (px, py, pz) => this.projectWorld(world, px, py, pz),
+    });
+    this.bondStats = { drawn, truncated: net.truncated || net.pairCount > MAX_SEGMENTS };
+  }
+
+  /** Шлейфы траекторий меченых частиц. */
+  private drawTrails(world: World): void {
+    if (!this.options.showTrails) {
+      this.trailLayer.hideAll();
+      return;
+    }
+    const periodic = world.params.boundary === 'periodic';
+    const segments = this.trails.segments(world.box, periodic, this.scratch);
+    // Разорванные периодической границей отрезки пропускаем: иначе на экране
+    // появлялись бы линии поперёк всей сцены.
+    const clean = this.filterWrapped(segments);
+    this.trailLayer.draw(clean, {
+      color: TRAIL_COLOR,
+      thickness: this.lineThickness(1.2),
+      alpha: 0.5,
+      project: (px, py, pz) => this.projectWorld(world, px, py, pz),
+    });
+  }
+
+  /** Векторы скоростей: короткие штрихи по направлению движения. */
+  private drawVectors(world: World): void {
+    if (!this.options.showVectors) {
+      this.vectorLayer.hideAll();
+      return;
+    }
+    const buffer = this.scratch;
+    buffer.count = 0;
+    const count = Math.min(world.state.count, DRAW_LIMIT);
+    const x = world.state.x;
+    const y = world.state.y;
+    const z = world.state.z;
+    const vx = world.state.vx;
+    const vy = world.state.vy;
+    const vz = world.state.vz;
+    const alive = world.state.alive;
+    // Масштаб штриха подбирается так, чтобы средняя скорость давала отрезок
+    // порядка четверти межатомного расстояния — иначе векторы либо не видны,
+    // либо превращаются в длинные линии и забивают картинку.
+    const speedScale = 0.25 / Math.max(0.2, world.measurement.meanSpeed + 1e-9);
+    for (let i = 0; i < count; i++) {
+      if (alive[i] === 0) continue;
+      const wx = vx[i] * speedScale;
+      const wy = vy[i] * speedScale;
+      const wz = vz[i] * speedScale;
+      if (!buffer.push(x[i], y[i], z[i], x[i] + wx, y[i] + wy, z[i] + wz, false)) break;
+    }
+    this.vectorLayer.draw(buffer, {
+      color: VECTOR_COLOR,
+      thickness: this.lineThickness(1.1),
+      alpha: 0.55,
+      project: (px, py, pz) => this.projectWorld(world, px, py, pz),
+    });
+  }
+
+  /** Убрать отрезки, разорванные периодической границей. */
+  private filterWrapped(buffer: SegmentBuffer): SegmentBuffer {
+    const out = new SegmentBuffer(Math.max(1, buffer.count));
+    for (let k = 0; k < buffer.count; k++) {
+      if (buffer.wrapped[k] !== 0) continue;
+      const base = k * 6;
+      out.push(
+        buffer.data[base],
+        buffer.data[base + 1],
+        buffer.data[base + 2],
+        buffer.data[base + 3],
+        buffer.data[base + 4],
+        buffer.data[base + 5],
+        false,
+      );
+    }
+    return out;
+  }
+
+  /** Сколько связей нарисовано в последнем кадре. */
+  get bondStatsSnapshot(): BondRenderStats {
+    return this.bondStats;
+  }
+
+  /**
+   * Спрайты слоя связей — для сквозных проверок в браузере.
+   *
+   * Нужны, чтобы проверить, что отрезки действительно ПОВЁРНУТЫ: без флага
+   * `rotation` в `dynamicProperties` все связи остаются горизонтальными,
+   * и координационное число при этом верное — ошибка не видна иначе.
+   */
+  get bondSprites(): readonly Particle[] {
+    return this.bondLayer.segmentSprites;
+  }
+
+  /** Слой связей: под частицами (по умолчанию) или поверх них. */
+  setBondsOnTop(onTop: boolean): void {
+    if (this.options.bondsOnTop === onTop) return;
+    this.options.bondsOnTop = onTop;
+    // `addChild` переносит элемент в конец списка — так меняется порядок.
+    this.app.stage.addChild(onTop ? this.particles : this.bondLayer.view);
+    this.app.stage.addChild(onTop ? this.bondLayer.view : this.particles);
   }
 
   /** Сколько частиц нарисовано в последнем кадре. */
@@ -281,9 +548,17 @@ export class SceneRenderer {
     return this.allocated;
   }
 
+  /** Сколько спрайтов связей выделено — для тестов. */
+  get bondSpriteCount(): number {
+    return this.bondLayer.spriteCount;
+  }
+
   /** Уничтожение сцены. */
   destroy(): void {
     this.particles?.destroy();
+    this.bondLayer?.destroy();
+    this.trailLayer?.destroy();
+    this.vectorLayer?.destroy();
     this.overlay?.destroy();
     this.texture?.destroy(true);
     this.sprites.length = 0;

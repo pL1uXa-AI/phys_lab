@@ -155,6 +155,10 @@ export class App {
       particleScale: this.state.view.particleScale,
       depthShading: this.state.view.depthShading,
       showWalls: this.state.view.showWalls,
+      showBonds: this.state.view.showBonds,
+      bondRadius: this.state.view.bondRadius,
+      showTrails: this.state.view.showTrails,
+      showVectors: this.state.view.showVectors,
       stepsPerFrame: this.state.stepsPerFrame,
       sampleRadial: this.state.sampleRadial,
       autoSteps: this.state.autoSteps,
@@ -315,6 +319,22 @@ export class App {
       setShowWalls: (value) => {
         this.state.view.showWalls = value;
         this.renderer.options.showWalls = value;
+      },
+      setShowBonds: (value) => {
+        this.state.view.showBonds = value;
+        this.renderer.options.showBonds = value;
+      },
+      setBondRadius: (value) => {
+        this.state.view.bondRadius = value;
+        this.renderer.options.bondRadius = value;
+      },
+      setShowTrails: (value) => {
+        this.state.view.showTrails = value;
+        this.renderer.options.showTrails = value;
+      },
+      setShowVectors: (value) => {
+        this.state.view.showVectors = value;
+        this.renderer.options.showVectors = value;
       },
       setStepsPerFrame: (value) => {
         this.state.stepsPerFrame = Math.round(value);
@@ -675,6 +695,9 @@ export class App {
 
   private updateHud(): void {
     const m = this.world.measurement;
+    // Сеть связей строится лениво и кэшируется до следующего шага физики,
+    // поэтому её можно спросить и здесь: лишнего обхода пар не будет.
+    const bonds = this.world.bondNetwork();
     const rows: Array<[string, string]> = [
       ['частиц', format.int(m.count)],
       ['T*', format.value(m.temperature)],
@@ -683,6 +706,8 @@ export class App {
       ['E пот', format.energy(this.world.potentialEnergy)],
       ['E полн', format.energy(m.total)],
       ['P*', format.value(m.pressure, 2)],
+      ['связей/атом', format.value(bonds.meanCoordination(this.world.state), 2)],
+      ['разброс связей', format.value(bonds.lengthSpread(), 3)],
       ['пик g(r)', format.value(this.world.orderPeak, 2)],
       ['время τ', format.time(this.world.time)],
       ['пар', format.int(this.world.pairCount)],
@@ -867,6 +892,15 @@ export class App {
           this.drawPlots();
         },
         openHelp: () => openHelp(),
+        setBondRadius: (value: number) => {
+          this.state.view.bondRadius = value;
+          this.renderer.options.bondRadius = value;
+          this.world.bondNetwork(value);
+        },
+        setShowBonds: (value: boolean) => {
+          this.state.view.showBonds = value;
+          this.renderer.options.showBonds = value;
+        },
       },
       plots: {
         temperature: () => this.plotT,
@@ -890,6 +924,10 @@ export class App {
         time: this.world.time,
         steps: this.world.steps,
         box: this.world.box,
+        coordination: this.world.bondNetwork().meanCoordination(this.world.state),
+        bondPairs: this.world.bondNetwork().pairCount,
+        bondSpread: this.world.bondNetwork().lengthSpread(),
+        bondsDrawn: this.renderer.bondStatsSnapshot.drawn,
       }),
       boxLength: (count: number, density: number) => boxLength(count, density),
     };
@@ -917,6 +955,10 @@ export interface PhysLabApi {
     stepOnce(): void;
     runSteps(count: number): void;
     openHelp(): void;
+    /** Сменить радиус связей (и перестроить сеть). */
+    setBondRadius(value: number): void;
+    /** Включить или выключить слой связей. */
+    setShowBonds(value: boolean): void;
   };
   plots: {
     temperature(): HTMLCanvasElement;
@@ -934,6 +976,14 @@ export interface PhysLabApi {
     time: number;
     steps: number;
     box: number;
+    /** Среднее число связей на частицу (координационное число). */
+    coordination: number;
+    /** Число пар в сети связей. */
+    bondPairs: number;
+    /** Разброс длин связей относительно 2^(1/6)σ. */
+    bondSpread: number;
+    /** Сколько связей реально нарисовано в последнем кадре. */
+    bondsDrawn: number;
   };
   boxLength(count: number, density: number): number;
 }

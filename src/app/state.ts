@@ -22,6 +22,19 @@ export interface ViewState {
   particleScale: number;
   /** Учитывать ли глубину при отрисовке. */
   depthShading: boolean;
+  /**
+   * Рисовать ли связи ближних соседей.
+   *
+   * Включено по умолчанию: без связей кристалл, жидкость и газ на экране
+   * почти неотличимы — это и была главная претензия к виду сцены.
+   */
+  showBonds: boolean;
+  /** Радиус связи в единицах σ. */
+  bondRadius: number;
+  /** Рисовать ли шлейфы траекторий у частиц-«меченых». */
+  showTrails: boolean;
+  /** Рисовать ли векторы скоростей. */
+  showVectors: boolean;
 }
 
 /** Состояние приложения. */
@@ -53,6 +66,10 @@ export class AppState {
     showWalls: true,
     particleScale: 1,
     depthShading: true,
+    showBonds: true,
+    bondRadius: 1.45,
+    showTrails: true,
+    showVectors: false,
   };
 
   /** Активный пресет (для подсветки кнопки). */

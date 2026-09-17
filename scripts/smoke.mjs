@@ -349,6 +349,96 @@ async function main() {
         `насыщенных ${colors.saturated} из ${colors.counted}`,
     );
 
+    /* --- 3c. Связи ближних соседей: слой структуры --- */
+    // Без этого слоя кристалл и жидкость на экране неотличимы — главная
+    // претензия к виду сцены. Проверяем не «слой включён», а что он даёт
+    // ФИЗИЧЕСКИ ВЕРНУЮ картину: у кристалла координационное число близко
+    // к 12, у газа связей почти нет, и связи действительно рисуются.
+    const bonds = await client.evaluate(`
+      (() => {
+        const app = window.__physLab;
+        app.actions.setShowBonds(true);
+        app.actions.applyPreset('crystal');
+        app.actions.runSteps(200);
+        app.renderer.render(app.world);
+        const crystal = app.metrics();
+        app.actions.applyPreset('gas');
+        app.actions.runSteps(100);
+        app.renderer.render(app.world);
+        const gas = app.metrics();
+        app.actions.applyPreset('liquid');
+        app.actions.runSteps(200);
+        app.renderer.render(app.world);
+        const liquid = app.metrics();
+        return { crystal, gas, liquid };
+      })()
+    `, 300000);
+    check(
+      'у кристалла 12 связей на атом',
+      bonds.crystal.coordination > 11 && bonds.crystal.coordination < 13,
+      `кристалл: ${bonds.crystal.coordination.toFixed(2)} связей/атом, пар ${bonds.crystal.bondPairs}`,
+    );
+    check(
+      'у газа связей почти нет',
+      bonds.gas.coordination < 1,
+      `газ: ${bonds.gas.coordination.toFixed(2)} связей/атом`,
+    );
+    check(
+      'у жидкости связей меньше, чем у кристалла',
+      bonds.liquid.coordination < bonds.crystal.coordination - 0.5,
+      `жидкость: ${bonds.liquid.coordination.toFixed(2)}, кристалл: ${bonds.crystal.coordination.toFixed(2)}`,
+    );
+    check(
+      'связи действительно нарисованы',
+      bonds.crystal.bondsDrawn > 5000,
+      `нарисовано связей: ${bonds.crystal.bondsDrawn}`,
+    );
+    // Дефект, который ловится только здесь: при потере флага `rotation` в
+    // `dynamicProperties` все отрезки остаются горизонтальными. Тогда
+    // координационное число верное, а картинка — штриховка вместо решётки.
+    const bondRotations = await client.evaluate(`
+      (() => {
+        const app = window.__physLab;
+        app.actions.applyPreset('liquid');
+        app.actions.runSteps(120);
+        app.renderer.render(app.world);
+        const sprites = app.renderer.bondSprites || [];
+        const angles = new Set();
+        for (let i = 0; i < sprites.length; i++) {
+          const s = sprites[i];
+          if (!s || s.alpha <= 0) continue;
+          angles.add(Math.round((s.rotation || 0) * 20));
+        }
+        return angles.size;
+      })()
+    `, 300000);
+    check(
+      'связи ориентированы по-разному, а не все горизонтальны',
+      bondRotations > 12,
+      `различных углов наклона: ${bondRotations}`,
+    );
+
+    /* --- 3d. Слой связей отключается --- */
+    const bondsOff = await client.evaluate(`
+      (() => {
+        const app = window.__physLab;
+        app.actions.applyPreset('crystal');
+        app.actions.runSteps(150);
+        app.actions.setShowBonds(false);
+        app.renderer.render(app.world);
+        const off = app.metrics().bondsDrawn;
+        app.actions.setShowBonds(true);
+        app.renderer.render(app.world);
+        const on = app.metrics().bondsDrawn;
+        return { off, on };
+      })()
+    `, 300000);
+    check(
+      'выключение слоя связей убирает линии',
+      bondsOff.off === 0 && bondsOff.on > 0,
+      `выключено: ${bondsOff.off}, включено: ${bondsOff.on}`,
+    );
+
     /* --- 4. Симуляция продвигается --- */
     const advanced = await client.evaluate(`
       (() => {
