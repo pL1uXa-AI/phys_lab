@@ -25,6 +25,7 @@
 
 import { World } from '../core/world.js';
 import type { LatticeKind, WorldParams } from '../core/types.js';
+import type { ViewBonds } from '../core/physics-view.js';
 import {
   buildCurves,
   workerSupported,
@@ -85,15 +86,7 @@ export interface MirrorState {
 }
 
 /** Сеть связей в том виде, в каком её читает отрисовка. */
-export interface MirrorBonds {
-  pairCount: number;
-  a: Int32Array;
-  b: Int32Array;
-  length: Float32Array;
-  dx: Float32Array;
-  dy: Float32Array;
-  dz: Float32Array;
-}
+export interface MirrorBonds extends ViewBonds {}
 
 /** Сводка измерений — повторяет `FrameSummary` без параметров мира. */
 export type FrameSummaryLike = Omit<FramePayload['summary'], 'params'>;
@@ -141,6 +134,18 @@ export class PhysicsWorkerClient {
 
   /** Последний полученный кадр или null. */
   get frame(): FramePayload | null {
+    return this.latest;
+  }
+
+  /**
+   * Последний кадр, полученный от воркера.
+   *
+   * Отличается от `consume()` тем, что НЕ забирает буферы: нужен там, где
+   * важны только сводные величины кадра (например, в самопроверке), и
+   * возвращать буферы обратно воркеру не требуется — процесс всё равно
+   * завершается.
+   */
+  get lastFrame(): FramePayload | null {
     return this.latest;
   }
 
@@ -221,8 +226,9 @@ export class PhysicsWorkerClient {
     if (!this.worker) return;
     // Кривые и сводка не входят в набор буферов: они не передавались по
     // владению и живут в главном потоке как обычные копии.
-    const { bondCount, summary, curves, ...buffers } = frame;
+    const { bondCount, bondTruncated, summary, curves, ...buffers } = frame;
     void bondCount;
+    void bondTruncated;
     void summary;
     void curves;
     const command = { type: 'recycle', ...buffers } as unknown as WorkerCommand;
@@ -320,6 +326,7 @@ export function localFrame(world: World): FramePayload {
     bondDy: net.dy,
     bondDz: net.dz,
     bondCount: net.pairCount,
+    bondTruncated: net.truncated,
     curves: buildCurves(world),
     summary: {
       count,
@@ -425,5 +432,8 @@ export function bondsOfFrame(frame: FramePayload): MirrorBonds {
     dx: frame.bondDx,
     dy: frame.bondDy,
     dz: frame.bondDz,
+    // Обрезка связей происходит на стороне воркера: он знает и число пар, и
+    // ёмкость буфера. Сюда приходит уже готовый признак.
+    truncated: frame.bondTruncated,
   };
 }

@@ -35,7 +35,7 @@ import {
   Texture,
 } from 'pixi.js';
 import type { ColorMode } from '../core/types.js';
-import type { World } from '../core/world.js';
+import type { PhysicsView } from '../core/physics-view.js';
 import { Camera } from './camera.js';
 import { LineLayer, MAX_SEGMENTS } from './lines.js';
 import { colorFor, BOND_COLOR, FROZEN_COLOR, TRAIL_COLOR, WALL_COLOR } from './palette.js';
@@ -190,7 +190,7 @@ export class SceneRenderer {
    * @param world       состояние симуляции
    * @param brush       кисть воздействия (рисуется кольцом) или null
    */
-  render(world: World, brush: { x: number; y: number; radius: number } | null = null): RenderStats {
+  render(world: PhysicsView, brush: { x: number; y: number; radius: number } | null = null): RenderStats {
     const started = performance.now();
     const count = Math.min(world.state.count, DRAW_LIMIT);
     this.ensureSprites(count);
@@ -299,7 +299,7 @@ export class SceneRenderer {
    * буфер, здесь точка одна. Формула поворота обязана совпадать с
    * `World.project` до последнего знака: иначе линии разъедутся с частицами.
    */
-  private projectWorld(world: World, x: number, y: number, z: number): { x: number; y: number } {
+  private projectWorld(world: PhysicsView, x: number, y: number, z: number): { x: number; y: number } {
     const center = world.box * 0.5;
     const ax = x - center;
     const ay = y - center;
@@ -342,7 +342,7 @@ export class SceneRenderer {
    * мира, смена числа в панели): иначе индексы указывали бы на несуществующие
    * атомы. Проверка дешёвая — сравнение с числом, записанным в прошлый раз.
    */
-  private recordTrails(world: World): void {
+  private recordTrails(world: PhysicsView): void {
     const count = world.state.count;
     if (count !== this.markedFor) {
       this.trails.markEvenly(count);
@@ -371,7 +371,7 @@ export class SceneRenderer {
    * прямая линия между абсолютными координатами пересекла бы весь ящик.
    * Минимальный образ даёт короткий правильный отрезок.
    */
-  private drawBonds(world: World): void {
+  private drawBonds(world: PhysicsView): void {
     if (!this.options.showBonds) {
       this.bondLayer.hideAll();
       this.bondStats = { drawn: 0, truncated: false };
@@ -416,7 +416,7 @@ export class SceneRenderer {
   }
 
   /** Шлейфы траекторий меченых частиц. */
-  private drawTrails(world: World): void {
+  private drawTrails(world: PhysicsView): void {
     if (!this.options.showTrails) {
       this.trailLayer.hideAll();
       return;
@@ -435,7 +435,7 @@ export class SceneRenderer {
   }
 
   /** Векторы скоростей: короткие штрихи по направлению движения. */
-  private drawVectors(world: World): void {
+  private drawVectors(world: PhysicsView): void {
     if (!this.options.showVectors) {
       this.vectorLayer.hideAll();
       return;
@@ -519,7 +519,7 @@ export class SceneRenderer {
   }
 
   /** Стенки ящика и кисть. */
-  private drawOverlay(world: World, brush: { x: number; y: number; radius: number } | null): void {
+  private drawOverlay(world: PhysicsView, brush: { x: number; y: number; radius: number } | null): void {
     const g = this.overlay;
     g.clear();
 
@@ -546,7 +546,7 @@ export class SceneRenderer {
   }
 
   /** Проекция произвольной точки мира на экран. */
-  projectPoint(world: World, point: readonly [number, number, number]): { x: number; y: number } {
+  projectPoint(world: PhysicsView, point: readonly [number, number, number]): { x: number; y: number } {
     const center = world.box * 0.5;
     const ax = point[0] - center;
     const ay = point[1] - center;

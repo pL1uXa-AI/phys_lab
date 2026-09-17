@@ -42,6 +42,7 @@ import { LEVELS, levelNumber, type Level } from '../levels/levels.js';
 import type { LevelReport } from '../levels/checks.js';
 import { parseSnapshot, serializeSnapshot } from '../core/snapshot.js';
 import { PhaseExperiment, type ExperimentConfig } from '../core/experiment.js';
+import { PhysicsBridge } from '../worker/bridge.js';
 import {
   canvasToPng,
   downloadDataUrl,
@@ -1373,6 +1374,7 @@ export class App {
         bonds = this.renderer.bondStatsSnapshot.drawn;
         return { msPerFrame: total / Math.max(1, frames), particles, bonds };
       },
+      workerSelfTest: (steps?: number) => PhysicsBridge.selfTest(steps),
     };
   }
 }
@@ -1475,4 +1477,13 @@ export interface PhysLabApi {
   timings(): { physicsMs: number; drawMs: number; stepsPerFrame: number; bondsDrawn: number };
   /** Замер только отрисовки, без шагов физики. */
   measureDraw(frames: number): { msPerFrame: number; particles: number; bonds: number };
+  /**
+   * Самопроверка воркера физики «на живом».
+   *
+   * Поднимает настоящий воркер, гоняет шаги и возвращает сводку. Нужна
+   * сквозной проверке в браузере: юнит-тесты подставляют подставной порт и
+   * потому не доказывают, что Vite собрал модуль воркера и что обмен
+   * кадрами работает в реальной среде.
+   */
+  workerSelfTest(steps?: number): Promise<{ ok: boolean; error?: string; summary?: unknown }>;
 }

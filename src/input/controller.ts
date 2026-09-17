@@ -16,7 +16,7 @@
  */
 
 import type { SceneRenderer } from '../render/scene.js';
-import type { World } from '../core/world.js';
+import type { PhysicsView } from '../core/physics-view.js';
 
 /** Что делает контроллер. */
 export interface InputActions {
@@ -42,7 +42,7 @@ type DragMode = 'none' | 'poke' | 'rotate' | 'pan';
 export class InputController {
   readonly actions: InputActions;
   readonly renderer: SceneRenderer;
-  readonly world: World;
+  readonly world: PhysicsView;
 
   /** Кисть: где и какого радиуса (в σ) будет воздействие. */
   brush = { x: 0, y: 0, radius: 3, active: false };
@@ -62,7 +62,7 @@ export class InputController {
   private readonly element: HTMLElement;
   private readonly disposers: Array<() => void> = [];
 
-  constructor(element: HTMLElement, renderer: SceneRenderer, world: World, actions: InputActions) {
+  constructor(element: HTMLElement, renderer: SceneRenderer, world: PhysicsView, actions: InputActions) {
     this.element = element;
     this.renderer = renderer;
     this.world = world;

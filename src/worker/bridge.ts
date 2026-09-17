@@ -32,6 +32,7 @@ import { parseSnapshot, serializeSnapshot } from '../core/snapshot.js';
 import type { LatticeKind, WorldParams } from '../core/types.js';
 import { PhysicsWorkerClient } from './client.js';
 import { WorldMirror } from './mirror.js';
+import type { FramePayload } from './protocol.js';
 
 /** Где считаются силы. */
 export type PhysicsMode = 'worker' | 'local';
@@ -68,6 +69,51 @@ export class PhysicsBridge {
   constructor(initial: World) {
     this.local = initial;
     this.world = initial;
+  }
+
+  /**
+   * Проверка воркера «на живом»: поднять, прогнать шаги, вернуть сводку.
+   *
+   * Нужна сквозной проверке в браузере. Юнит-тесты подставляют подставной
+   * порт и потому НЕ доказывают, что настоящий `Worker` действительно
+   * стартует, что Vite собрал модуль воркера и что обмен кадрами работает
+   * в реальной среде. Этот метод закрывает именно этот пробел.
+   *
+   * @returns сводка после прогона или текст ошибки
+   */
+  static async selfTest(steps = 40): Promise<{ ok: boolean; error?: string; summary?: unknown }> {
+    const world = new World({ count: 256 }, 20260214, 'fcc');
+    const bridge = new PhysicsBridge(world);
+    if (!bridge.enableWorker()) {
+      return { ok: false, error: bridge.status().error ?? 'воркер не поднялся' };
+    }
+    // Ждём готовности мира: она приходит асинхронно.
+    const deadline = Date.now() + 15000;
+    while (!bridge.workerReady && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      bridge.sync();
+    }
+    if (!bridge.workerReady) {
+      bridge.destroy();
+      return { ok: false, error: 'мир воркера не сообщил о готовности за 15 с' };
+    }
+    bridge.advance(steps);
+    // Даём воркеру время посчитать и прислать кадр.
+    const frameDeadline = Date.now() + 15000;
+    let frame: FramePayload | null = null;
+    while (!frame && Date.now() < frameDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      bridge.sync();
+      frame = bridge.client.lastFrame;
+    }
+    bridge.destroy();
+    if (!frame) return { ok: false, error: 'кадр от воркера не пришёл за 15 с' };
+    /*
+     * Возвращается СВОДКА кадра, а не `measurement`: в сводке есть время и
+     * число шагов, по которым проверка убеждается, что воркер действительно
+     * считал, а не прислал начальное состояние.
+     */
+    return { ok: true, summary: frame.summary };
   }
 
   /** Текущий статус. */

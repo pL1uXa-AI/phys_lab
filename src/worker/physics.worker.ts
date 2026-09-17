@@ -207,15 +207,24 @@ function makeFrame(w: World): FramePayload {
     params: { ...w.params },
   };
 
-  return { ...buffers, bondCount: pairs, summary, curves: buildCurves(w) };
+  return {
+    ...buffers,
+    bondCount: pairs,
+    // Обрезали ли сеть: если пар больше, чем влезло в буфер, отрисовка
+    // обязана сообщить об этом, а не рисовать молча неполную структуру.
+    bondTruncated: net.truncated || net.pairCount > bondCapacity,
+    summary,
+    curves: buildCurves(w),
+  };
 }
 
 /** Собрать и отправить кадр. */
 function emitFrame(): void {
   if (!world) return;
   const payload = makeFrame(world);
-  const { bondCount, summary, curves, ...buffers } = payload;
+  const { bondCount, bondTruncated, summary, curves, ...buffers } = payload;
   void bondCount;
+  void bondTruncated;
   void summary;
   void curves;
   emit({ type: 'frame', payload }, transferList(buffers));

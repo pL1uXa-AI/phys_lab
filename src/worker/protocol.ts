@@ -140,6 +140,8 @@ export type WorkerEvent =
 export interface FramePayload extends FrameBuffersPayload {
   /** Сколько пар связей действительно заполнено. */
   bondCount: number;
+  /** Упёрлась ли сеть связей в потолок числа пар. */
+  bondTruncated: boolean;
   /** Сводка измерений — её показывает панель HUD. */
   summary: FrameSummary;
   /** Кривые для графиков. */
