@@ -1,0 +1,115 @@
+/**
+ * Построение ячеек (списков Верле).
+ *
+ * Наивный расчёт сил проверяет все пары: N(N−1)/2 ≈ 5·10⁶ для 2000 частиц и
+ * 5·10⁷ для 10 000 — на каждом шаге. Сетка сводит работу к O(N): каждая
+ * частица сравнивается только с соседями из 27 ближайших ячеек.
+ *
+ * Сетка кубическая, размер ячейки ≥ радиуса обрезания, число ячеек по оси
+ * n = floor(L / cellSize). Проверка «не потерялись ли соседи» вынесена в
+ * тесты: при cellSize < cutoff часть пар исчезает, и это надо ловить сразу.
+ *
+ * Реализация — counting sort без ветвлений в горячем цикле:
+ *   1) обнулить счётчики, 2) посчитать частицы по ячейкам,
+ *   3) префиксной суммой получить начала, 4) разложить индексы по местам.
+ */
+
+import type { CellGrid, ParticleState } from './types.js';
+
+/** Номер ячейки по целочисленным индексам сетки. */
+export function cellOf(gx: number, gy: number, gz: number, n: number): number {
+  return (gx * n + gy) * n + gz;
+}
+
+/**
+ * Перестроение сетки для текущих координат.
+ *
+ * Координаты должны лежать в [0, box): это инвариант периодических границ,
+ * который поддерживает интегратор. Размер ячейки хранится в самой сетке,
+ * поэтому длина ящика отдельным аргументом не нужна — она уже учтена при
+ * построении (n = floor(L / cellSize), size = L / n).
+ */
+export function buildGrid(state: ParticleState, grid: CellGrid): void {
+  const n = grid.n;
+  const size = grid.size;
+  const counts = grid.counts;
+  const order = grid.order;
+  const cellIndex = grid.cellIndex;
+  const cellStart = grid.cellStart;
+
+  counts.fill(0);
+
+  const count = state.count;
+  const x = state.x;
+  const y = state.y;
+  const z = state.z;
+  const alive = state.alive;
+
+  // Первый проход: сколько частиц в каждой ячейке. Мёртвые (за пределами
+  // открытого ящика) получают индекс −1 и в списки не попадают.
+  for (let i = 0; i < count; i++) {
+    if (alive[i] === 0) {
+      cellIndex[i] = -1;
+      continue;
+    }
+    let gx = Math.floor(x[i] / size);
+    let gy = Math.floor(y[i] / size);
+    let gz = Math.floor(z[i] / size);
+    // Страховка от −0 и от крошечного выхода за границу из-за округления.
+    if (gx < 0) gx = 0;
+    else if (gx >= n) gx = n - 1;
+    if (gy < 0) gy = 0;
+    else if (gy >= n) gy = n - 1;
+    if (gz < 0) gz = 0;
+    else if (gz >= n) gz = n - 1;
+    const c = cellOf(gx, gy, gz, n);
+    cellIndex[i] = c;
+    counts[c]++;
+  }
+
+  // Префиксная сумма: cellStart[c] — начало списка ячейки c.
+  let running = 0;
+  const cellCount = n * n * n;
+  for (let c = 0; c < cellCount; c++) {
+    cellStart[c] = running;
+    running += counts[c];
+  }
+  cellStart[cellCount] = running;
+
+  // Второй проход: раскладка индексов. counts используется как «курсор».
+  counts.fill(0);
+  for (let i = 0; i < count; i++) {
+    const c = cellIndex[i];
+    if (c < 0) continue;
+    order[cellStart[c] + counts[c]] = i;
+    counts[c]++;
+  }
+}
+
+/**
+ * Размер ячейки по умолчанию.
+ *
+ * Ячейка обязана быть НЕ МЕНЬШЕ радиуса поиска (как у сил, так и у списка
+ * соседей с «кожей»). Иначе сосед может оказаться не в соседней ячейке,
+ * а через одну, и часть пар потеряется.
+ *
+ * Арифметика: rc = 2.5, кожа 0.4 → нужен радиус 2.9. Множитель 1.35 даёт
+ * ячейку 3.375, то есть запас 0.47. Если увеличивать кожу выше 0.8, множитель
+ * придётся поднимать вместе с ней — иначе список начнёт терять соседей.
+ */
+export const CELL_SIZE_FACTOR = 1.35;
+
+/** Размер ячейки для заданного радиуса обрезания. */
+export function cellSizeFor(cutoff: number): number {
+  return cutoff * CELL_SIZE_FACTOR;
+}
+
+/**
+ * Проверка, что размер ячейки вмещает радиус поиска вместе с «кожей».
+ * Вызывается из тестов: молчаливая потеря соседей — самый неприятный класс
+ * дефектов в МД, потому что проявляется не падением, а «странной» физикой
+ * (система медленно холодеет, потому что часть сил просто не считается).
+ */
+export function gridIsSafe(grid: CellGrid, searchRadius: number): boolean {
+  return grid.size + 1e-12 >= searchRadius;
+}

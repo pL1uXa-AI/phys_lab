@@ -1,0 +1,256 @@
+/**
+ * Модель мира и единицы измерения.
+ *
+ * Симуляция живёт в «приведённых» единицах Леннарда-Джонса: ε = 1, σ = 1,
+ * масса атома m = 1. В этих единицах все величины порядка единицы, а шаг
+ * интегрирования измеряется в безразмерном времени τ = t·√(ε/mσ²).
+ *
+ * Типичные ориентиры (для аргона σ ≈ 0.34 нм, ε/k_B ≈ 120 К):
+ *   температура  T* = k_B·T/ε   — плавление трёхмерного LJ ≈ 0.7, кипение ≈ 0.85
+ *   плотность    ρ* = N·σ³/V    — кристалл ≈ 0.85, жидкость ≈ 0.7, газ < 0.2
+ *   шаг          dt ≈ 0.001…0.005 τ
+ *
+ * Данные частиц хранятся в плоских типизированных массивах (SoA, structure of
+ * arrays), а не в массиве объектов: горячий цикл обходит десятки тысяч частиц
+ * на каждом шаге, и обращение к памяти должно быть последовательным.
+ */
+
+/** Тип граничных условий. */
+export type BoundaryMode =
+  /** Периодические границы: ящик без стенок, бесконечный кристалл. */
+  | 'periodic'
+  /** Отражающие стенки: конечный ящик. */
+  | 'reflective'
+  /** Открытый ящик: частицы улетают навсегда (испарение без стенок). */
+  | 'open';
+
+/** Термостат — способ удерживать заданную температуру. */
+export type ThermostatKind =
+  /** Без термостата: микроканонический ансамбль, энергия сохраняется. */
+  | 'none'
+  /** Ланжевен: трение плюс случайная сила. Локальный, не портит динамику фаз. */
+  | 'langevin'
+  /** Берендсен: масштабирование скоростей к целевой температуре. Дёшево и грубо. */
+  | 'berendsen'
+  /** Нозе-Хувер: канонический ансамбль, честная динамика (в форме Hoover). */
+  | 'nose-hoover';
+
+/** Режим визуализации — как раскрашивать частицы. */
+export type ColorMode =
+  /** Цвет по модулю скорости. */
+  | 'speed'
+  /** Цвет по локальной плотности (число соседей в сфере). */
+  | 'density'
+  /** Цвет по накопленному пути: у кристалла он почти нулевой, у жидкости растёт. */
+  | 'travel'
+  /** Один цвет для всех. */
+  | 'plain';
+
+/** Параметры потенциала и ящика. */
+export interface WorldParams {
+  /** Число частиц. */
+  count: number;
+  /** Плотность ρ* = N σ³ / V. */
+  density: number;
+  /** Радиус обрезания потенциала в единицах σ. */
+  cutoff: number;
+  /** Шаг интегрирования в приведённом времени. */
+  dt: number;
+  /** Температура термостата T* (в единицах ε/k_B). */
+  temperature: number;
+  /** Тип границ. */
+  boundary: BoundaryMode;
+  /** Термостат. */
+  thermostat: ThermostatKind;
+  /** Время релаксации термостата (в единицах τ). */
+  thermostatTau: number;
+  /** Сила трения Ланжевена, 1/τ. */
+  friction: number;
+}
+
+/** Значения по умолчанию: жидкая плёнка из 2000 частиц при T* = 0.9. */
+export const DEFAULT_PARAMS: WorldParams = {
+  count: 2000,
+  density: 0.65,
+  cutoff: 2.5,
+  dt: 0.004,
+  temperature: 0.9,
+  boundary: 'periodic',
+  thermostat: 'berendsen',
+  thermostatTau: 0.4,
+  friction: 0.5,
+};
+
+/**
+ * Шаг сетки для списков Верле. Должен быть не меньше радиуса обрезания,
+ * иначе часть соседей потеряется; берём с запасом.
+ */
+export const CELL_SIZE_FACTOR = 1.05;
+
+/** Длина ящика из числа частиц и плотности: L = (N/ρ)^(1/3). */
+export function boxLength(count: number, density: number): number {
+  return Math.cbrt(count / density);
+}
+
+/** Плотность из длины ящика: ρ = N / L³. */
+export function densityOf(count: number, box: number): number {
+  return count / (box * box * box);
+}
+
+// ---------------------------------------------------------------------------
+// Плоские массивы состояния
+// ---------------------------------------------------------------------------
+
+/**
+ * Состояние всех частиц. Все массивы одной длины `count`.
+ *
+ * Координаты хранятся в диапазоне [0, L) — это инвариант периодических границ.
+ * Скорости — в единицах σ/τ, силы — в единицах ε/σ.
+ */
+export interface ParticleState {
+  /** Число частиц. */
+  count: number;
+  x: Float64Array;
+  y: Float64Array;
+  z: Float64Array;
+  /** Координаты на предыдущем шаге: их требует интегрирование Верле. */
+  px: Float64Array;
+  py: Float64Array;
+  pz: Float64Array;
+  vx: Float64Array;
+  vy: Float64Array;
+  vz: Float64Array;
+  fx: Float64Array;
+  fy: Float64Array;
+  fz: Float64Array;
+  /** Модуль скорости — кэш для раскраски, пересчитывается при измерении. */
+  speed: Float64Array;
+  /**
+   * Накопленный путь от начального положения (в σ). Растёт как √t у кристалла
+   * (колебания вокруг узла) и линейно у жидкости. Используется для раскраски
+   * «смещение»: сразу видно, кто сидит на месте, а кто уехал.
+   */
+  travel: Float64Array;
+  /**
+   * Смещение от исходного положения (в σ) — модуль вектора, а не путь.
+   *
+   * Разница принципиальна: у кристалла частица колеблется вокруг узла, и
+   * накопленный путь за долгое время может стать большим, а смещение при этом
+   * остаётся порядка 0.1σ. Признак «система расплавилась» обязан считаться по
+   * смещению, иначе всякий кристалл через минуту выглядит как жидкость.
+   */
+  displacement: Float64Array;
+  /** Локальная плотность (число соседей) — для раскраски по плотности. */
+  neighbours: Float64Array;
+  /** Индекс типа частицы (задел под Уровень 2: разные атомы и ионы). */
+  type: Uint8Array;
+  /** Заряд в единицах элементарного (задел под ионные расплавы). */
+  charge: Float64Array;
+  /** Исходные координаты решётки — точка отсчёта для смещения. */
+  refX: Float64Array;
+  refY: Float64Array;
+  refZ: Float64Array;
+  /** Признак «частица внутри ящика»: за пределами открытого ящика — 0. */
+  alive: Uint8Array;
+}
+
+/** Выделение состояния под `count` частиц. */
+export function allocState(count: number): ParticleState {
+  return {
+    count,
+    x: new Float64Array(count),
+    y: new Float64Array(count),
+    z: new Float64Array(count),
+    px: new Float64Array(count),
+    py: new Float64Array(count),
+    pz: new Float64Array(count),
+    vx: new Float64Array(count),
+    vy: new Float64Array(count),
+    vz: new Float64Array(count),
+    fx: new Float64Array(count),
+    fy: new Float64Array(count),
+    fz: new Float64Array(count),
+    speed: new Float64Array(count),
+    travel: new Float64Array(count),
+    displacement: new Float64Array(count),
+    neighbours: new Float64Array(count),
+    type: new Uint8Array(count),
+    charge: new Float64Array(count),
+    refX: new Float64Array(count),
+    refY: new Float64Array(count),
+    refZ: new Float64Array(count),
+    alive: new Uint8Array(count),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Ячейки (списки Верле)
+// ---------------------------------------------------------------------------
+
+/**
+ * Регулярная сетка ячеек для поиска соседей за O(N).
+ *
+ * Устройство — «считающая сортировка» (counting sort) по ячейкам:
+ *   - `cellStart[c]` — начало списка частиц ячейки c в массиве `order`;
+ *   - `order` — индексы частиц, сгруппированные по ячейкам;
+ *   - `cellIndex[i]` — номер ячейки частицы i (нужен для поиска соседей).
+ *
+ * Массивы переиспользуются между шагами: перевыделение в горячем цикле недопустимо.
+ */
+export interface CellGrid {
+  /** Число ячеек по каждой оси (сетка кубическая). */
+  n: number;
+  /** Размер ячейки. */
+  size: number;
+  /** cellStart[c]..cellStart[c+1] — диапазон частиц ячейки c. */
+  cellStart: Int32Array;
+  order: Int32Array;
+  cellIndex: Int32Array;
+  /** Сколько частиц реально в каждой ячейке — для подсчёта cellStart. */
+  counts: Int32Array;
+}
+
+/** Создание сетки под ящик `box` и размер ячейки `cellSize`. */
+export function allocGrid(box: number, cellSize: number): CellGrid {
+  const n = Math.max(1, Math.floor(box / cellSize));
+  const cells = n * n * n;
+  return {
+    n,
+    size: box / n,
+    cellStart: new Int32Array(cells + 1),
+    order: new Int32Array(0),
+    cellIndex: new Int32Array(0),
+    counts: new Int32Array(cells),
+  };
+}
+
+/** Выравнивание сетки под новое число частиц. Массивы увеличиваются при нужде. */
+export function resizeGrid(grid: CellGrid, box: number, cellSize: number, count: number): void {
+  const n = Math.max(1, Math.floor(box / cellSize));
+  if (n !== grid.n) {
+    const cells = n * n * n;
+    grid.n = n;
+    grid.size = box / n;
+    grid.cellStart = new Int32Array(cells + 1);
+    grid.counts = new Int32Array(cells);
+  }
+  if (grid.order.length !== count) {
+    grid.order = new Int32Array(count);
+    grid.cellIndex = new Int32Array(count);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Готовые состояния (пресеты)
+// ---------------------------------------------------------------------------
+
+/** Пресет начальной конфигурации. */
+export type LatticeKind =
+  /** ГЦК-решётка — равновесная структура Леннард-Джонса при низкой температуре. */
+  | 'fcc'
+  /** Простая кубическая решётка. */
+  | 'sc'
+  /** Случайный газ: частицы расставлены без наложений. */
+  | 'random'
+  /** Жидкая плёнка в центре ящика (для наблюдения поверхностного натяжения). */
+  | 'droplet'

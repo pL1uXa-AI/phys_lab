@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    // vite/client — типы импорта ассетов; node — для тестов, читающих файлы с диска.
+    "types": ["vite/client", "node"],
+
+    /* Строгость. noUncheckedIndexedAccess выключен осознанно: горячий цикл
+       симуляции читает типизированные массивы (координаты, списки соседей,
+       ячейки) по индексу. Флаг потребовал бы сотен non-null утверждений в
+       самом нагруженном месте без реального выигрыша — корректность индексов
+       гарантируется инвариантами построения сетки и покрыта тестами. */
+    "strict": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "noEmit": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "useDefineForClassFields": true
+  },
+  "include": ["src", "vite.config.ts"]
+}
