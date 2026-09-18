@@ -223,8 +223,19 @@ function makeFrame(w: World): FramePayload {
   const measurement = w.measurement;
   const structurePeak = w.structure.firstPeak();
   const diffusionResult = w.diffusion();
+  /*
+   * Число ЖИВЫХ частиц.
+   *
+   * `w.state.count` — это размер массивов, он не меняется, когда частицы
+   * улетают за открытые границы: `removeEscaped` лишь помечает их мёртвыми.
+   * Именно по убыли живых проверяется уровень «Испарение», поэтому величина
+   * считается здесь, а не берётся из общего числа.
+   */
+  let aliveCount = 0;
+  for (let i = 0; i < count; i++) if (w.state.alive[i] !== 0) aliveCount++;
   const summary: FrameSummary = {
     count,
+    aliveCount,
     box: w.box,
     time: w.time,
     steps: w.steps,
@@ -355,6 +366,12 @@ self.onmessage = (event: MessageEvent<WorkerCommand>) => {
         break;
       case 'unfreezeAll':
         w.unfreezeAll();
+        break;
+      case 'freezeRegion':
+        w.freezeRegion(
+          { w: command.axis, center: command.center },
+          command.radius,
+        );
         break;
       case 'rebuild':
         w.requestRebuild(command.lattice, command.keepTemperature);

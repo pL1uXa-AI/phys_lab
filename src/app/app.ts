@@ -97,6 +97,22 @@ export class App {
   renderer!: SceneRenderer;
   input!: InputController;
   session: LevelSession | null = null;
+  /**
+   * Сколько шагов физики сессия уровня уже учла.
+   *
+   * Нужен, чтобы продвигать её на РАЗНИЦУ монотонного счётчика, а не на
+   * заказанное число: в режиме воркера это разные величины. `-1` — «ещё не
+   * привязано», при старте уровня значение берётся из мира.
+   */
+  private sessionExecuted = -1;
+  /**
+   * Уровень, ожидающий подтверждения пересборки мира.
+   *
+   * В режиме воркера команды асинхронны, поэтому сессию нельзя создавать в
+   * том же кадре, что и пересборку: она запомнила бы прежний мир как точку
+   * отсчёта. Пока здесь лежит уровень, сессия ещё не начата.
+   */
+  private pendingLevel: { level: Level; waitUntilFrame: number; since: number } | null = null;
 
   private readonly host: HTMLElement;
   private app: Application;
@@ -1000,7 +1016,14 @@ export class App {
   }
 
   private freezeAt(px: number, py: number): void {
-    this.bridge.freezeRegion(this.brushPlane(px, py), this.input.brushRadius);
+    const frozen = this.bridge.freezeRegion(this.brushPlane(px, py), this.input.brushRadius);
+    /*
+     * В режиме воркера число замороженных приходит из другого потока, поэтому
+     * здесь его нет (-1). Показываем факт и просим подождать — иначе нажатие
+     * выглядит как «ничего не произошло», и это уже было отдельной жалобой.
+     */
+    if (frozen < 0) this.showNotice('Заморозка области отправлена');
+    else this.showNotice(`Заморожено частиц: ${frozen}`);
   }
 
   private unfreezeAt(_px: number, _py: number): void {
@@ -1038,27 +1061,79 @@ export class App {
     this.state.levelId = level.id;
     this.state.presetId = null;
     this.presetHighlight(null);
-    /*
-     * Сессия уровня работает с ЛОКАЛЬНЫМ миром.
-     *
-     * Это осознанное ограничение: проверки уровня читают историю измерений
-     * и накопленную статистику, а в режиме воркера в главном потоке есть
-     * только зеркало последнего кадра. Поэтому при запуске уровня физика
-     * возвращается в главный поток, и кампания работает как раньше.
-     */
-    this.bridge.disableWorker();
-    this.session = new LevelSession(level, this.bridge.localWorld);
     this.paused = false;
     this.state.running = true;
     const btn = need<HTMLButtonElement>('[data-action="run"]', this.host);
     btn.textContent = 'Пауза';
     this.afterRebuild();
-    this.campaign.showLevel(level, this.session.lastReport, this.session.progress);
+    this.campaign.showLevel(level, null, 0);
     document.body.dataset['level'] = level.id;
+    /*
+     * Сессия создаётся НЕ здесь, а когда мир подтвердит пересборку.
+     *
+     * `applyParamsAndResize` в режиме воркера только отправляет команды: на
+     * этот момент зеркало ещё показывает ПРЕЖНИЙ мир. Сессия, созданная тут
+     * же, запомнила бы старое число частиц и старую потенциальную энергию как
+     * точку отсчёта — и уровень проверялся бы по чужим данным. Поэтому
+     * ждём кадр, в котором пересборка уже видна.
+     */
+    this.pendingLevel = this.bridge.usingWorker
+      ? { level, waitUntilFrame: this.bridge.status().framesReceived + 1, since: performance.now() }
+      : null;
+    if (!this.bridge.usingWorker) this.beginLevel(level);
+  }
+
+  /**
+   * Начать сессию уровня по уже подтверждённому миру.
+   *
+   * Вызывается сразу в локальном режиме и после первого кадра с пересборкой
+   * в режиме воркера (см. `startLevel`).
+   */
+  private beginLevel(level: Level): void {
+    /*
+     * Сессия уровня работает с миром ДЛЯ ЧТЕНИЯ, то есть с зеркалом.
+     *
+     * Раньше здесь стояло `bridge.disableWorker()`: считалось, что проверки
+     * уровня читают историю и накопленную статистику, которых в зеркале нет.
+     * Оказалось, что не хватало всего двух величин — `potentialPerParticle`
+     * (энергия на частицу, нужна условию «энергия упала») и той части истории,
+     * что раньше отдавалась нулями. Обе передаются, поэтому кампания теперь
+     * идёт при работающем воркере: физика остаётся в отдельном потоке, и
+     * уровень не теряет в плавности.
+     */
+    this.session = new LevelSession(level, this.world);
+    // Сессия привязывается к текущему счётчику шагов: считать она должна
+    // только те, что будут сделаны после старта уровня.
+    this.sessionExecuted = this.world.stepsExecuted;
+    this.campaign.showLevel(level, this.session.lastReport, this.session.progress);
+  }
+
+  /**
+   * Дождаться пересборки мира под уровень и начать сессию.
+   *
+   * Проверяется именно НОВЫЙ кадр от воркера, а не совпадение параметров:
+   * ГЦК округляет число частиц до 4n³, поэтому сравнение по числу не сработало
+   * бы. Номер полученных кадров — надёжный признак «пересборка приехала».
+   */
+  private settlePendingLevel(): void {
+    const pending = this.pendingLevel;
+    if (!pending) return;
+    const frames = this.bridge.status().framesReceived;
+    const timedOut = performance.now() - pending.since > 5000;
+    if (frames < pending.waitUntilFrame && !timedOut) return;
+    this.pendingLevel = null;
+    if (timedOut && frames < pending.waitUntilFrame) {
+      // Кадр так и не пришёл: сообщаем честно, а не проверяем уровень по
+      // данным прежнего мира — это дало бы ложное прохождение.
+      this.showNotice('Уровень не подтвердил пересборку мира', true);
+    }
+    this.beginLevel(pending.level);
   }
 
   private exitToSandbox(): void {
     this.session = null;
+    this.pendingLevel = null;
+    this.sessionExecuted = -1;
     this.state.levelId = null;
     delete document.body.dataset['level'];
     this.campaign.showSandbox();
@@ -1067,7 +1142,7 @@ export class App {
   /** Немедленная проверка уровня (кнопка «Проверить»). */
   checkLevel(): LevelReport | null {
     if (!this.session) return null;
-    const report = this.session.checkNow(this.bridge.localWorld);
+    const report = this.session.checkNow(this.world);
     this.campaign.showLevel(this.session.level, report, this.session.progress);
     if (report.passed) {
       this.campaign.markCompleted(this.session.level.id);
@@ -1102,6 +1177,8 @@ export class App {
       // локально: кадры воркера здесь не нужны и только мешали бы.
     } else {
       this.bridge.sync();
+      // Пересборка под уровень приехала — можно начинать сессию.
+      this.settlePendingLevel();
     }
 
     if (this.experiment) {
@@ -1123,7 +1200,17 @@ export class App {
        * стоимость видно по частоте кадров и по `timings()`.
        */
       this.bridge.advance(steps);
-      for (let i = 0; i < steps; i++) this.tickSession();
+      /*
+       * Сессия уровня продвигается по ФАКТИЧЕСКИ выполненным шагам.
+       *
+       * Раньше здесь стоял цикл по заказанным шагам (`for i < steps`), и в
+       * режиме воркера это неверно дважды: заказ может быть придержан
+       * обратным давлением, а выполняется он позже, в другом потоке. Сессия
+       * считала бы шаги, которых ещё не было, и уровень «выходил на режим»
+       * раньше времени. Счётчик `stepsExecuted` монотонный, поэтому разница
+       * даёт ровно число новых шагов — независимо от режима.
+       */
+      this.tickSession();
       this.physicsMs = performance.now() - physicsStart;
       // Кадр статистики g(r) считается ПОСЛЕ замера шага.
       //
@@ -1167,9 +1254,39 @@ export class App {
     requestAnimationFrame(this.loop);
   };
 
+  /**
+   * Продвинуть сессию уровня по фактически выполненным шагам.
+   *
+   * ─── Почему именно так ───────────────────────────────────────────────────
+   *
+   * Сессия должна видеть ровно те шаги, которые физика действительно
+   * сделала. В локальном режиме это очевидно, а в режиме воркера заказ и
+   * выполнение разнесены: часть порции может быть придержана обратным
+   * давлением, часть — ещё считаться. Разница монотонного `stepsExecuted`
+   * даёт точное число новых шагов в обоих режимах.
+   *
+   * Мир берётся из `this.world` — то есть зеркало в режиме воркера. Поэтому
+   * кампания больше НЕ требует выключать воркер: проверки уровня читают
+   * измерение, историю, g(r) и потенциальную энергию, а всё это зеркало
+   * отдаёт.
+   */
   private tickSession(): void {
     if (!this.session) return;
-    const report = this.session.tick(this.bridge.localWorld);
+    const executed = this.world.stepsExecuted;
+    if (this.sessionExecuted < 0) this.sessionExecuted = executed;
+    let fresh = executed - this.sessionExecuted;
+    this.sessionExecuted = executed;
+    if (fresh <= 0) return;
+    // Ограничение на случай длинной паузы: за один вызов нельзя прокрутить
+    // больше, чем физика реально сделала, но и «догонять» тысячи шагов
+    // скопом незачем — отчёт всё равно пересчитывается раз в 120 шагов.
+    fresh = Math.min(fresh, 5000);
+
+    let report = this.session.lastReport;
+    for (let i = 0; i < fresh; i++) {
+      const next = this.session.tick(this.world);
+      if (next) report = next;
+    }
     if (report && this.uiCounter % 4 === 0) {
       this.campaign.showLevel(this.session.level, report, this.session.progress);
       if (report.passed) {
@@ -1684,6 +1801,26 @@ export class App {
           return { lag: Array.from(curve.lag), msd: Array.from(curve.msd) };
         },
         /**
+         * Заморозить область в ЦЕНТРЕ сцены — для сквозных проверок.
+         *
+         * Проверке нужен детерминированный цилиндр, а не координаты курсора:
+         * в headless-браузере указателя нет. Ось берётся из камеры, радиус —
+         * из кисти, то есть путь тот же, что у настоящего клика, и в режиме
+         * воркера команда уходит так же.
+         */
+        freezeRegionAtCenter: () => {
+          const center = this.world.box * 0.5;
+          this.bridge.freezeRegion(
+            {
+              w: this.world.viewAxis(this.renderer.camera.yaw, this.renderer.camera.pitch),
+              center: { x: center, y: center, z: center },
+            },
+            this.input.brushRadius,
+          );
+        },
+        /** Снять заморозку со всех частиц — нужно проверке заморозки области. */
+        unfreezeAll: () => this.bridge.unfreezeAll(),
+        /**
          * Снимок мира как JSON-строка — для сквозных проверок.
          *
          * Настоящее сохранение идёт через скачивание файла, а его в headless
@@ -1868,6 +2005,32 @@ export class App {
           radialSamples: this.world.radial.sampleCount,
           structureSamples: this.world.structure.sampleCount,
           msdOrigins: this.world.msd.originCount,
+          /*
+           * Параметры МИРА ДЛЯ ЧТЕНИЯ (в режиме воркера — зеркала).
+           *
+           * Без них проверить, что уровень применил свои настройки, нечем:
+           * `api().world` — это ЛОКАЛЬНЫЙ мир, и в режиме воркера он сохраняет
+           * исходные параметры. На этом я уже дважды получил ложные выводы.
+           */
+          temperature: this.world.params.temperature,
+          density: this.world.params.density,
+          thermostat: this.world.params.thermostat,
+          boundary: this.world.params.boundary,
+          measurementTemperature: this.world.measurement.temperature,
+          /**
+           * Сколько частиц заморожено сейчас.
+           *
+           * Считается по маске мира для чтения. Нужно инструментам проверки:
+           * заморозка области в режиме воркера уходит командой, и убедиться,
+           * что она ДОШЛА, можно только по маске в зеркале.
+           */
+          frozenCount: (() => {
+            let n = 0;
+            for (let i = 0; i < this.world.state.count; i++) {
+              if (this.world.frozen[i] !== 0) n++;
+            }
+            return n;
+          })(),
         };
       },
       /**
@@ -1918,6 +2081,15 @@ export interface PhysLabApi {
     setBondRadius(value: number): void;
     /** Включить или выключить слой связей. */
     setShowBonds(value: boolean): void;
+    /**
+     * Заморозить область в центре сцены — для сквозных проверок.
+     *
+     * Путь тот же, что у настоящего клика (ось из камеры, радиус из кисти),
+     * но без координат курсора: в headless-браузере указателя нет.
+     */
+    freezeRegionAtCenter(): void;
+    /** Снять заморозку со всех частиц. */
+    unfreezeAll(): void;
     /** Кривая MSD (лаг и смещение) — для проверок. */
     msdCsv(): { lag: number[]; msd: number[] };
     /** Сериализованный снимок мира (JSON-строка). */
@@ -2028,6 +2200,18 @@ export interface PhysLabApi {
     structureSamples: number;
     /** Число начал отсчёта MSD. */
     msdOrigins: number;
+    /** Целевая температура мира для чтения (в воркере — зеркала). */
+    temperature: number;
+    /** Плотность мира для чтения. */
+    density: number;
+    /** Термостат мира для чтения. */
+    thermostat: string;
+    /** Границы мира для чтения. */
+    boundary: string;
+    /** Измеренная температура мира для чтения. */
+    measurementTemperature: number;
+    /** Сколько частиц заморожено сейчас (по маске мира для чтения). */
+    frozenCount: number;
   };
   /**
    * Вернуть физику в главный поток — для инструментов проверки.

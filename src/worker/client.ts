@@ -340,6 +340,7 @@ export function localFrame(world: World): FramePayload {
     curves: buildCurves(world),
     summary: {
       count,
+      aliveCount: m.count,
       box: world.box,
       time: world.time,
       steps: world.steps,

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Сессия уровня: следит за ходом выполнения задания.
  *
  * Уровень — это не «пройдено / не пройдено», а набор признаков, каждый из
@@ -10,7 +10,7 @@
  * посчитать отчёт и как часто это повторять.
  */
 
-import type { World } from '../core/world.js';
+import type { PhysicsView } from '../core/physics-view.js';
 import {
   type LevelMetrics,
   type LevelReport,
@@ -48,7 +48,7 @@ export class LevelSession {
   private readonly reportInterval = 120;
   private lastReportStep = -1;
 
-  constructor(level: Level, world: World) {
+  constructor(level: Level, world: PhysicsView) {
     this.level = level;
     this.startCount = world.measurement.count;
     this.msdOrigin = new Float64Array(world.state.count * 3);
@@ -60,7 +60,7 @@ export class LevelSession {
   }
 
   /** Привязать сессию к миру: пересобрать буферы под новое число частиц. */
-  private captureMsdOrigin(world: World): void {
+  private captureMsdOrigin(world: PhysicsView): void {
     const state = world.state;
     for (let i = 0; i < state.count; i++) {
       this.msdOrigin[i * 3] = state.x[i];
@@ -74,7 +74,7 @@ export class LevelSession {
    *
    * @returns отчёт, если его пора пересчитать, иначе null
    */
-  tick(world: World): LevelReport | null {
+  tick(world: PhysicsView): LevelReport | null {
     if (this.status === 'passed' || this.status === 'idle') return null;
     this.steps++;
 
@@ -113,7 +113,7 @@ export class LevelSession {
    * Накопление величин, которые нельзя измерить в один момент:
    * давление, энергия и средний квадрат смещения требуют окна.
    */
-  private collect(world: World, metrics: LevelMetrics): void {
+  private collect(world: PhysicsView, metrics: LevelMetrics): void {
     this.window.size++;
     this.window.add('temperature', metrics.temperature);
     this.window.add('pressure', metrics.pressure);
@@ -155,12 +155,12 @@ export class LevelSession {
     }
   }
 
-  private energyOriginReset(world: World): void {
+  private energyOriginReset(world: PhysicsView): void {
     this.energyOrigin = world.potentialPerParticle;
   }
 
   /** Отчёт по текущему состоянию без ожидания окна — для кнопки «Проверить». */
-  checkNow(world: World): LevelReport {
+  checkNow(world: PhysicsView): LevelReport {
     const metrics = metricsOf(world, this.startCount);
     // Даём хотя бы один замер в окно, иначе условия по средним не посчитаются.
     if (this.window.size === 0) {
@@ -185,3 +185,4 @@ export class LevelSession {
     return Math.min(1, this.steps / Math.max(1, this.level.equilibrate));
   }
 }
+

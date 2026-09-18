@@ -150,6 +150,14 @@ export class WorldMirror {
   readonly speedClampedCount: number;
   readonly gridIsSafe: boolean;
   readonly potentialEnergy: number;
+  /**
+   * Потенциальная энергия на живую частицу.
+   *
+   * Нужна проверкам уровней («энергия упала на 25 %»): сравнивать с нулём
+   * бессмысленно, точка отсчёта — своя у каждого старта. Считается из полной
+   * энергии и числа живых частиц — тех данных, что уже есть в кадре.
+   */
+  readonly potentialPerParticle: number;
   readonly volume: number;
   readonly msdReady: boolean;
   readonly msdProgress: number;
@@ -173,6 +181,8 @@ export class WorldMirror {
     this.speedClampedCount = s.speedClamped;
     this.gridIsSafe = s.gridIsSafe;
     this.potentialEnergy = s.potential;
+    // Знаменатель — число ЖИВЫХ частиц (см. объяснение у `measurement.count`).
+    this.potentialPerParticle = s.potential / Math.max(1, s.aliveCount);
     this.volume = s.box * s.box * s.box;
     this.msdReady = s.msdReady;
     this.msdProgress = s.msdProgress;
@@ -201,14 +211,25 @@ export class WorldMirror {
     };
 
     this.measurement = {
-      count: s.count,
+      /*
+       * Число ЖИВЫХ частиц, а не размер массивов.
+       *
+       * `s.count` не меняется при испарении: улетевшие частицы помечаются
+       * мёртвыми, но остаются в массивах. Проверки уровней считают убыль как
+       * `startCount − count`, поэтому подстановка общего числа давала ровно
+       * ноль («испарилось 0 из 2048») и уровень «Испарение» в режиме воркера
+       * не проходился никогда. Измерено: локально 21 с, в воркере — не
+       * проходился за 90 с.
+       */
+      count: s.aliveCount,
       kinetic: s.kinetic,
       potential: s.potential,
       total: s.total,
       temperature: s.temperature,
       // Число степеней свободы: три забраны движением центра масс при
-      // периодических границах — та же формула, что в ядре.
-      dof: Math.max(1, 3 * s.count - (s.params.boundary === 'periodic' && s.count > 1 ? 3 : 0)),
+      // периодических границах — та же формула, что в ядре, и по живым
+      // частицам (иначе при испарении знаменатель завышался бы).
+      dof: Math.max(1, 3 * s.aliveCount - (s.params.boundary === 'periodic' && s.aliveCount > 1 ? 3 : 0)),
       pressure: s.pressure,
       virial: s.virial,
       meanSpeed: s.meanSpeed,

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Вычисление условий уровней.
  *
  * Каждое условие — это сравнение ИЗМЕРЕННОЙ величины с порогом. Здесь важно
@@ -15,7 +15,7 @@
  *      чем начинать считать.
  */
 
-import type { World } from '../core/world.js';
+import type { PhysicsView } from '../core/physics-view.js';
 import type { LevelCheck } from './levels.js';
 
 /** Один измеренный признак. */
@@ -96,7 +96,7 @@ export interface LevelMetrics {
 }
 
 /** Сбор величин из мира. */
-export function metricsOf(world: World, startCount: number): LevelMetrics {
+export function metricsOf(world: PhysicsView, startCount: number): LevelMetrics {
   const measurement = world.measurement;
   const alive = measurement.count;
   return {
@@ -121,7 +121,7 @@ export function metricsOf(world: World, startCount: number): LevelMetrics {
  * за испаряющимися частицами, и привязка к геометрическому центру ящика дала
  * бы ложную картину.
  */
-export function confinedFraction(world: World, radius: number): number {
+export function confinedFraction(world: PhysicsView, radius: number): number {
   const state = world.state;
   let count = 0;
   let cx = 0;
@@ -163,7 +163,7 @@ export function evaluateCheck(
   check: LevelCheck,
   metrics: LevelMetrics,
   window: MeasurementWindow,
-  world: World,
+  world: PhysicsView,
 ): CheckResult {
   const within = (value: number, min?: number, max?: number): boolean =>
     (min === undefined || value >= min) && (max === undefined || value <= max);
@@ -339,7 +339,7 @@ export function evaluateLevel(
   checks: LevelCheck[],
   metrics: LevelMetrics,
   window: MeasurementWindow,
-  world: World,
+  world: PhysicsView,
 ): LevelReport {
   const results = checks.map((check) => evaluateCheck(check, metrics, window, world));
   return {
@@ -348,3 +348,4 @@ export function evaluateLevel(
     results,
   };
 }
+

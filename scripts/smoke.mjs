@@ -413,6 +413,47 @@ async function main() {
         : 'очередь не разобралась за 3 с — проверить не удалось',
     );
 
+    /*
+     * --- Заморозка ОБЛАСТИ в режиме воркера ---
+     *
+     * Раньше это было невозможно по вине кода: `freezeRegion` возвращал 0 и
+     * НИЧЕГО не отправлял — кнопка «Заморозить» в режиме воркера была мертва,
+     * потому что ось взгляда «нельзя передать в команду». На деле её
+     * передают тем же способом, что и кисть.
+     *
+     * Проверяется именно доставка: команда уходит, воркер её выполняет, и
+     * маска заморозки в ЗЕРКАЛЕ становится ненулевой. По `api().world`
+     * проверять бессмысленно — это локальный мир, он стоит на месте.
+     */
+    const freezeWorker = await client.evaluate(`
+      (async () => {
+        const app = window.__physLab;
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const before = app.workerDiagnostics().frozenCount;
+        app.actions.freezeRegionAtCenter();
+        let after = before;
+        for (let i = 0; i < 40; i++) {
+          await sleep(150);
+          after = app.workerDiagnostics().frozenCount;
+          if (after > before) break;
+        }
+        app.actions.unfreezeAll();
+        await sleep(800);
+        return {
+          mode: app.physicsMode(),
+          before,
+          after,
+          cleared: app.workerDiagnostics().frozenCount,
+        };
+      })()
+    `, 60000);
+    check(
+      'заморозка области доходит до воркера',
+      freezeWorker.mode === 'worker' && freezeWorker.after > 0 && freezeWorker.cleared === 0,
+      `режим ${freezeWorker.mode}, было ${freezeWorker.before}, заморожено ${freezeWorker.after}, ` +
+        `после разморозки ${freezeWorker.cleared}`,
+    );
+
     // Переходим в локальный режим для остальных проверок.
     await client.evaluate('window.__physLab.useLocalPhysics()');
     const localMode = await client.evaluate('window.__physLab.physicsMode()');

@@ -27,6 +27,8 @@ import { WorldMirror } from '../worker/mirror.js';
 // обязаны совпадать, иначе кисть бьёт не туда, куда смотрит курсор.
 import { viewAxis } from '../core/integrator.js';
 import { localFrame } from '../worker/client.js';
+import { LevelSession } from '../levels/session.js';
+import { LEVELS } from '../levels/levels.js';
 import type { WorkerCommand } from '../worker/protocol.js';
 
 /** Подставной порт воркера: записывает команды и умеет отвечать. */
@@ -217,18 +219,53 @@ describe('мост физики: маршрутизация команд', () =>
     expect(port.last).toEqual({ type: 'sampleRadial' });
   });
 
-  it('заморозка области в режиме воркера не подменяется молча', () => {
-    // Область задаётся осью взгляда, а её в команду передать пока нельзя.
-    // Вернуть «заморозили всё» было бы хуже, чем вернуть ноль: игрок увидит,
-    // что операция не сработала, а не получит неверный результат.
+  it('заморозка области уходит в воркер вместе с осью взгляда', () => {
+    /*
+     * Раньше здесь проверялось обратное: `freezeRegion` возвращал 0 и НИЧЕГО
+     * не отправлял, потому что «ось взгляда в команду передать нельзя».
+     * На деле её передавать можно — тем же способом, что и кисть (см. соседний
+     * тест), поэтому кнопка «Заморозить» в режиме воркера была мертва.
+     *
+     * Теперь проверяется, что команда уходит и несёт ровно те данные, по
+     * которым воркер построит тот же цилиндр, что и главный поток.
+     */
     const { bridge, port } = workerBridge();
-    const frozenCount = port.commands.length;
-    const result = bridge.freezeRegion(
-      { w: viewAxis(0, 1), center: { x: 1, y: 1, z: 1 } },
-      2,
+    const before = port.commands.length;
+    const axis = viewAxis(0.6, 0.9);
+    const result = bridge.freezeRegion({ w: axis, center: { x: 1, y: 2, z: 3 } }, 2.5);
+
+    // Отрицательное значение — «отправлено, число узнаем из кадра»: оно
+    // отличимо от «заморожено 0 частиц», и это важно (см. нули в CSV).
+    expect(result).toBe(-1);
+    expect(port.commands.length).toBe(before + 1);
+    const command = port.last as unknown as {
+      type: string;
+      axis: { ax: number; ay: number; az: number };
+      center: { x: number; y: number; z: number };
+      radius: number;
+    };
+    expect(command.type).toBe('freezeRegion');
+    expect(command.radius).toBe(2.5);
+    expect(command.center).toEqual({ x: 1, y: 2, z: 3 });
+    expect(command.axis.ax).toBeCloseTo(axis.ax, 9);
+    expect(command.axis.ay).toBeCloseTo(axis.ay, 9);
+    expect(command.axis.az).toBeCloseTo(axis.az, 9);
+  });
+
+  it('заморозка области в локальном режиме возвращает число частиц', () => {
+    // Локальный режим считает сразу, поэтому здесь ответ конкретный, и он
+    // отличается от «отправлено» — проверяем именно различие.
+    const { bridge, world } = localBridge();
+    // Ставим частицы плотной решёткой и морозим цилиндр через центр ящика.
+    const center = world.box * 0.5;
+    const frozen = bridge.freezeRegion(
+      { w: viewAxis(0, 0), center: { x: center, y: center, z: center } },
+      world.box * 0.6,
     );
-    expect(result).toBe(0);
-    expect(port.commands.length).toBe(frozenCount);
+    expect(frozen).toBeGreaterThan(0);
+    let masked = 0;
+    for (let i = 0; i < world.state.count; i++) if (world.frozen[i] !== 0) masked++;
+    expect(masked).toBe(frozen);
   });
 
   it('кисть уходит в воркер вместе с осью взгляда', () => {
@@ -494,6 +531,123 @@ describe('зеркало: чтение совпадает с настоящим 
     const full = world.msdCurve().lag;
     const fullEnd = full[full.length - 1];
     expect(fromMirror.lagRange[1]).toBeLessThan(fullEnd);
+  });
+
+  it('энергия на частицу совпадает с миром, включая убыль частиц', () => {
+    /*
+     * `potentialPerParticle` — точка отсчёта условия «энергия упала на 25 %»
+     * в уровнях. Знаменатель у `World` — число ЖИВЫХ частиц, и на уровнях с
+     * открытыми границами (испарение, капля) оно меньше `count`. Если бы
+     * зеркало делило на общее число, величина систематически расходилась бы,
+     * и уровень не проходился бы в режиме воркера — при полностью верной
+     * физике.
+     */
+    const periodic = makeWorld();
+    const mirrorP = new WorldMirror(localFrame(periodic));
+    expect(mirrorP.potentialPerParticle).toBeCloseTo(periodic.potentialPerParticle, 9);
+
+    const open = new World(
+      { count: 500, density: 0.25, temperature: 1.6, thermostat: 'langevin', boundary: 'open' },
+      77,
+      'random',
+    );
+    // Гоняем достаточно, чтобы часть частиц покинула ящик и `alive` стал
+    // меньше общего числа — именно этот случай и был опасен.
+    open.run(600);
+    const frame = localFrame(open);
+    let alive = 0;
+    for (let i = 0; i < frame.summary.count; i++) if (frame.alive[i] !== 0) alive++;
+    expect(alive).toBeLessThan(frame.summary.count);
+
+    const mirrorO = new WorldMirror(frame);
+    expect(mirrorO.potentialPerParticle).toBeCloseTo(open.potentialPerParticle, 9);
+  });
+
+  it('сессия уровня даёт одинаковый отчёт по миру и по зеркалу', () => {
+    /*
+     * Это главное доказательство, что кампания может идти в режиме воркера.
+     *
+     * Раньше при старте уровня приложение ВЫКЛЮЧАЛО воркер, потому что сессия
+     * уровня читала накопленную статистику, которой в зеркале не было.
+     * Проверка сравнивает отчёты двух сессий на одном и том же состоянии:
+     * одну кормят настоящим миром, другую — зеркалом его кадра. Совпадение
+     * всех условий означает, что проверки уровня не зависят от источника
+     * данных, и воркер выключать не нужно.
+     *
+     * Ошибка здесь означала бы, что уровень проходится (или не проходится) в
+     * зависимости от режима физики — при одном и том же состоянии системы.
+     */
+    const world = makeWorld(512, 20260214);
+    // Прогоняем с накоплением статистики: уровням нужны g(r) и история.
+    for (let i = 0; i < 20; i++) {
+      world.run(20);
+      world.sampleRadial();
+    }
+    const frame = localFrame(world);
+    const mirror = new WorldMirror(frame);
+
+    const level = LEVELS[0];
+    // Обе сессии получают ОДНО состояние; окно наполняем одинаково.
+    const fromWorld = new LevelSession(level, world);
+    const fromMirror = new LevelSession(level, mirror);
+    for (let i = 0; i < 200; i++) {
+      world.step();
+      fromWorld.tick(world);
+      // Зеркало обновляем тем же состоянием, что и мир: сравниваем логику
+      // проверок, а не синхронность потоков.
+      fromMirror.tick(new WorldMirror(localFrame(world)));
+    }
+    const reportWorld = fromWorld.checkNow(world);
+    const reportMirror = fromMirror.checkNow(new WorldMirror(localFrame(world)));
+
+    expect(reportMirror.passed).toBe(reportWorld.passed);
+    expect(reportMirror.results.length).toBe(reportWorld.results.length);
+    for (let i = 0; i < reportWorld.results.length; i++) {
+      expect(reportMirror.results[i].passed, `условие ${i}`).toBe(
+        reportWorld.results[i].passed,
+      );
+    }
+    void frame;
+  });
+
+  it('зеркало считает ЖИВЫХ частиц, а не размер массивов', () => {
+    /*
+     * Дефект, из-за которого кампания не работала в режиме воркера.
+     *
+     * `state.count` — размер массивов; при испарении он НЕ меняется, потому
+     * что `removeEscaped` лишь помечает частицу мёртвой. Зеркало подставляло
+     * это число в `measurement.count`, а проверки уровней считают убыль как
+     * `startCount − count`. Получалось `N − N = 0`: уровень «Испарение»
+     * ВСЕГДА видел «испарилось 0 частиц» и не проходился никогда.
+     *
+     * Замерено до исправления: локально уровень проходился за 21 с, в режиме
+     * воркера — не проходился за 90 с (условия «T* ≥ 1.3» и «испарилось ≥ 40»
+     * показывали 0.000). После — 8.3 с в воркере и 16.8 с локально.
+     */
+    const open = new World(
+      { count: 500, density: 0.25, temperature: 1.8, thermostat: 'langevin', boundary: 'open' },
+      20260214,
+      'random',
+    );
+    open.run(900);
+    const frame = localFrame(open);
+
+    let alive = 0;
+    for (let i = 0; i < frame.summary.count; i++) if (frame.alive[i] !== 0) alive++;
+    // Часть частиц обязана улететь — иначе проверка ничего не проверяет.
+    expect(alive).toBeLessThan(frame.summary.count);
+    expect(frame.summary.aliveCount).toBe(alive);
+
+    const mirror = new WorldMirror(frame);
+    expect(mirror.measurement.count).toBe(alive);
+    expect(mirror.measurement.count).toBe(open.measurement.count);
+    // Убыль по зеркалу обязана совпасть с убылью по миру — по ней и работает
+    // уровень «Испарение».
+    const startCount = frame.summary.count;
+    expect(startCount - mirror.measurement.count).toBe(startCount - open.measurement.count);
+    // `state.count` при этом остаётся размером массивов: по нему идёт обход
+    // отрисовки, и он не должен «схлопываться» при испарении.
+    expect(mirror.state.count).toBe(frame.summary.count);
   });
 
   it('история отдаёт нужные ряды и не врёт про размер', () => {
