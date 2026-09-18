@@ -57,7 +57,7 @@ export interface PhysicsStatus {
  */
 export class PhysicsBridge {
   /** Мир для ЧТЕНИЯ: настоящий или зеркало. */
-  world: World | WorldMirror;
+  private current: World | WorldMirror;
   private readonly local: World;
   private readonly client = new PhysicsWorkerClient();
   private mode: PhysicsMode = 'local';
@@ -68,7 +68,31 @@ export class PhysicsBridge {
 
   constructor(initial: World) {
     this.local = initial;
-    this.world = initial;
+    this.current = initial;
+  }
+
+  /**
+   * Мир для ЧТЕНИЯ.
+   *
+   * В локальном режиме это настоящий `World`, в режиме воркера — зеркало
+   * последнего полученного кадра. Геттер, а не открытое поле: подменить мир
+   * можно только осознанно (`showWorldForReading`), а не присваиванием
+   * где-то в глубине приложения.
+   */
+  get world(): World | WorldMirror {
+    return this.current;
+  }
+
+  /**
+   * Локальный мир напрямую.
+   *
+   * Нужен там, где требуется именно объект `World`, а не контракт чтения:
+   * например, сессия кампании читает историю измерений и накопленную
+   * статистику, которых в зеркале кадра нет. Обращение явное и намеренно
+   * неудобное — чтобы не возникало соблазна «просто взять мир» в обычном коде.
+   */
+  get localWorld(): World {
+    return this.local;
   }
 
   /**
@@ -179,6 +203,16 @@ export class PhysicsBridge {
    *
    * Вызывается раз в кадр отрисовки ДО чтения состояния. Возвращает true,
    * если пришёл новый кадр.
+   *
+   * ─── Почему зеркало строится раньше возврата буферов ─────────────────────
+   *
+   * `consume()` возвращает буферы ПРЕДЫДУЩЕГО кадра воркеру — а это отчуждает
+   * память. Поэтому порядок такой: сначала берём новый кадр, строим по нему
+   * зеркало (оно ссылается на новые буферы), и только потом возвращаем старые.
+   *
+   * Раньше `consume()` вызывался первым, и получалось, что текущее зеркало
+   * ссылается на отчуждённые буферы: чтение падало с «Cannot perform
+   * Construct on a detached ArrayBuffer».
    */
   sync(): boolean {
     if (this.mode !== 'worker') return false;
@@ -187,7 +221,7 @@ export class PhysicsBridge {
     // Зеркало пересоздаётся на каждый кадр: буферы предыдущего уже отданы
     // воркеру обратно, и читать из них нельзя.
     this.mirror = new WorldMirror(frame);
-    this.world = this.mirror;
+    this.current = this.mirror;
     return true;
   }
 
@@ -204,6 +238,23 @@ export class PhysicsBridge {
       return;
     }
     for (let i = 0; i < steps; i++) this.local.step();
+  }
+
+  /**
+   * Прогнать шаги СИНХРОННО на локальном мире.
+   *
+   * Нужно инструментам проверки: они гоняют сотни шагов и сразу читают
+   * результат, что в режиме воркера невозможно в принципе (шаги там
+   * асинхронны). Метод намеренно назван отдельно от `advance`, чтобы
+   * случайно не вызвать его в игровом цикле и не посчитать физику дважды.
+   *
+   * @param onStep вызывается после каждого шага (сессия уровня, статистика)
+   */
+  advanceLocal(steps: number, onStep?: () => void): void {
+    for (let i = 0; i < steps; i++) {
+      this.local.step();
+      onStep?.();
+    }
   }
 
   /** Кадр статистики. */
@@ -249,6 +300,31 @@ export class PhysicsBridge {
       return;
     }
     this.local.setDensity(density);
+  }
+
+  /**
+   * Применить НАБОР параметров и пересобрать систему.
+   *
+   * Одним вызовом, а не девятью командами: пресет задаёт все параметры сразу,
+   * и промежуточные состояния (например, новая температура при старой
+   * плотности) воркеру видеть незачем — он успел бы сделать по ним шаг.
+   */
+  applyParamsAndResize(
+    params: Partial<WorldParams>,
+    count: number,
+    density: number,
+    lattice: LatticeKind,
+    equilibrate = 0,
+  ): void {
+    if (this.mode === 'worker') {
+      this.client.send({ type: 'configure', patch: params });
+      this.client.send({ type: 'resize', count, density, lattice });
+      if (equilibrate > 0) this.client.send({ type: 'run', steps: equilibrate });
+      return;
+    }
+    this.local.params = { ...this.local.params, ...params };
+    this.local.resize(count, density, lattice);
+    if (equilibrate > 0) this.local.run(equilibrate);
   }
 
   /** Пересборка под новое число частиц. */
@@ -389,11 +465,43 @@ export class PhysicsBridge {
 
   /** Остановить воркер и вернуться к локальному миру. */
   disableWorker(): void {
+    /*
+     * Сначала возвращаем мир для чтения, потом гасим воркер.
+     *
+     * Здесь был дефект, который ловился только в браузере: `disableWorker`
+     * завершал воркер, но в зеркале оставались буферы последнего кадра —
+     * а они были ПЕРЕДАНЫ по владению и к этому моменту отчуждены
+     * (`detached`). Следующее обращение к ним падало с «Cannot perform
+     * Construct on a detached ArrayBuffer», и падала легенда раскраски:
+     * она читает `colorValues`, а тот проходит по отчуждённому массиву.
+     *
+     * Порядок обязателен: мир для чтения переключается на локальный, пока
+     * зеркало ещё не утратило актуальность как объект.
+     */
+    this.current = this.local;
+    this.mirror = null;
     this.client.stop();
     this.mode = 'local';
     this.ready = false;
-    this.mirror = null;
-    this.world = this.local;
+  }
+
+  /**
+   * Подменить мир для ЧТЕНИЯ.
+   *
+   * Нужно режиму эксперимента: свип по температуре идёт в СВОЁМ мире, чтобы
+   * результат не зависел от того, что игрок делал до запуска. Сцена и
+   * графики при этом должны показывать именно мир эксперимента.
+   *
+   * Воркер на время эксперимента не останавливается: вернув основной мир,
+   * приложение продолжит с того же места.
+   */
+  showWorldForReading(world: World | WorldMirror): void {
+    this.current = world;
+  }
+
+  /** Вернуть для чтения основной мир. */
+  restoreReadingWorld(): void {
+    this.current = this.mode === 'worker' && this.mirror ? this.mirror : this.local;
   }
 
   /** Освободить ресурсы. */

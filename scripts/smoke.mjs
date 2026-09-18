@@ -276,6 +276,49 @@ async function main() {
     const booted = await client.evaluate('Boolean(window.__physLab)');
     check('приложение выставило публичный API', booted === true);
 
+    /*
+     * Сначала проверяем ВОРКЕР, потом переходим в локальный режим.
+     *
+     * Порядок принципиален и вот почему. Приложение по умолчанию считает
+     * физику в воркере. Но все остальные проверки этого файла МЕНЯЮТ мир
+     * синхронно (`resize`, `pokeNow`, `sampleRadial`) и сразу читают
+     * результат — в режиме воркера это невозможно: изменения уходят
+     * асинхронно, а рендер показывает зеркало другого мира. Проверять так
+     * физику значило бы проверять рассинхрон.
+     *
+     * Поэтому: сначала доказываем, что воркер РАБОТАЕТ, затем явно
+     * возвращаем физику в главный поток и проверяем всё остальное как
+     * раньше.
+     */
+    const physicsMode = await client.evaluate('window.__physLab.physicsMode()');
+    check(
+      'физика вынесена в воркер',
+      physicsMode === 'worker',
+      `режим: ${physicsMode}`,
+    );
+    const workerTest = await client.evaluate('window.__physLab.workerSelfTest(60)', 120000);
+    check(
+      'воркер физики запускается и считает шаги',
+      workerTest.ok === true,
+      workerTest.ok
+        ? `T* = ${(workerTest.summary?.temperature ?? 0).toFixed(3)}, шагов ${workerTest.summary?.steps ?? 0}`
+        : `ошибка: ${workerTest.error}`,
+    );
+    if (workerTest.ok) {
+      check(
+        'воркер вернул осмысленную сводку',
+        Number.isFinite(workerTest.summary?.temperature) &&
+          workerTest.summary.temperature > 0 &&
+          workerTest.summary.steps >= 60,
+        `T* = ${workerTest.summary?.temperature?.toFixed?.(3)}, шагов ${workerTest.summary?.steps}`,
+      );
+    }
+
+    // Переходим в локальный режим для остальных проверок.
+    await client.evaluate('window.__physLab.useLocalPhysics()');
+    const localMode = await client.evaluate('window.__physLab.physicsMode()');
+    check('режим локальной физики включается для проверок', localMode === 'local', `режим: ${localMode}`);
+
     const canvasInfo = await client.evaluate(`
       (() => {
         const canvas = document.querySelector('.stage canvas');
@@ -304,7 +347,6 @@ async function main() {
       const text = await client.evaluate('JSON.stringify(window.__smokeErrors)');
       console.log(`        ${text}`);
     }
-
     /* --- 3. Частицы действительно рисуются --- */
     const drawn = await client.evaluate('window.__physLab.renderer.drawnCount');
     check('частицы попадают в кадр', drawn > 500, `нарисовано: ${drawn}`);
@@ -1705,37 +1747,6 @@ async function main() {
         ? `кнопки: ${experimentUi.buttons.join(', ')}; ветви: ${experimentUi.branches.join(', ')}`
         : 'панель не найдена',
     );
-
-    /* --- 21i. Воркер физики на живом --- */
-    // Единственная проверка, которая доказывает, что воркер РАБОТАЕТ: юнит-
-    // тесты подставляют подставной порт и потому не видят ни сборку модуля
-    // воркера, ни поведение настоящего Worker в браузере.
-    // `workerSelfTest` лежит на верхнем уровне API, а не в `actions`:
-    // `actions` — это команды, меняющие состояние, а самопроверка ничего не
-    // меняет в текущем мире, она поднимает свой.
-    const workerTest = await client.evaluate(
-      'window.__physLab.workerSelfTest(60)',
-      120000,
-    );
-    check(
-      'воркер физики запускается и считает шаги',
-      workerTest.ok === true,
-      workerTest.ok
-        ? `сводка получена: T* = ${(workerTest.summary?.temperature ?? 0).toFixed(3)}, ` +
-          `шагов ${workerTest.summary?.steps ?? 0}`
-        : `ошибка: ${workerTest.error}`,
-    );
-    if (workerTest.ok) {
-      // Физика в воркере должна дать ТЕ ЖЕ величины, что локальная: если
-      // кадр собирается неверно, это видно по температуре и энергии.
-      check(
-        'воркер вернул осмысленную сводку',
-        Number.isFinite(workerTest.summary?.temperature) &&
-          workerTest.summary.temperature > 0 &&
-          workerTest.summary.steps >= 60,
-        `T* = ${workerTest.summary?.temperature?.toFixed?.(3)}, шагов ${workerTest.summary?.steps}`,
-      );
-    }
 
     /* --- 22. Скриншот витрины --- */
     const shot = await client.send('Page.captureScreenshot', { format: 'png' });

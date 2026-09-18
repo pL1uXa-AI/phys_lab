@@ -92,6 +92,61 @@ export interface ViewAxisLike {
   uz: number;
 }
 
+/** Один замер истории измерений. */
+export interface ViewSample {
+  time: number;
+  temperature: number;
+  kinetic: number;
+  potential: number;
+  total: number;
+  pressure: number;
+  orderPeak: number;
+  mobileFraction: number;
+}
+
+/** Названия рядов истории, которые рисуются графиками. */
+export type ViewSeriesKey =
+  | 'temperature'
+  | 'kinetic'
+  | 'potential'
+  | 'total'
+  | 'pressure'
+  | 'orderPeak'
+  | 'mobileFraction';
+
+/** История измерений в объёме, нужном графикам. */
+export interface ViewHistory {
+  readonly size: number;
+  get(index: number): ViewSample | undefined;
+  series(key: ViewSeriesKey, maxPoints?: number): { t: number[]; v: number[] };
+}
+
+/** Вид g(r) для графиков и панелей. */
+export interface ViewRadial {
+  readonly sampleCount: number;
+  /**
+   * Готовая кривая.
+   *
+   * В ядре `result(box)` требует длину ящика для нормировки; в зеркале
+   * нормировка уже сделана воркером, и аргумент не нужен. Поэтому параметр
+   * здесь НЕобязательный: иначе типы двух источников не сошлись бы, и
+   * пришлось бы либо тащить `box` в зеркало без надобности, либо подгонять
+   * сигнатуру на месте вызова.
+   */
+  result(box?: number): { r: Float64Array; g: Float64Array };
+}
+
+/** Вид S(k) для графиков и панелей. */
+export interface ViewStructure {
+  readonly sampleCount: number;
+  firstPeak(): { k: number; height: number };
+}
+
+/** Вид накопителя MSD для панелей. */
+export interface ViewMsd {
+  readonly originCount: number;
+}
+
 /**
  * Всё, что отрисовка и панели читают у физики.
  *
@@ -126,6 +181,30 @@ export interface PhysicsView {
   bondNetwork(radius?: number): ViewBonds;
   /** Ось взгляда по углам камеры. */
   viewAxis(yaw: number, pitch: number): ViewAxisLike;
+  /** История измерений — по ней рисуются графики T и энергий. */
+  readonly history: ViewHistory;
+  /** Готовая функция g(r). */
+  radialDistribution(): { r: Float64Array; g: Float64Array };
+  /** Накопитель g(r) — нужен ради счётчика кадров. */
+  readonly radial: ViewRadial;
+  /** Готовая кривая структурного фактора S(k). */
+  structureFactor(): { k: Float64Array; s: Float64Array };
+  /** Накопитель S(k) — нужен ради счётчика кадров и первого пика. */
+  readonly structure: ViewStructure;
+  /** Накопитель MSD — нужен ради числа начал отсчёта. */
+  readonly msd: ViewMsd;
+  /** Кривая среднеквадратичного смещения. */
+  msdCurve(): { lag: Float64Array; msd: Float64Array; counts: Int32Array };
+  /** Коэффициент диффузии и качество подгонки. */
+  diffusion(): { D: number; r2: number; lagRange: [number, number] };
+  /** Готово ли окно наблюдения MSD. */
+  readonly msdReady: boolean;
+  /** Доля заполнения окна MSD. */
+  readonly msdProgress: number;
+  /** Среднее координационное число. */
+  readonly coordination: number;
+  /** Разброс длин связей. */
+  readonly bondSpread: number;
 }
 
 /*

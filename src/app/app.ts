@@ -43,6 +43,7 @@ import type { LevelReport } from '../levels/checks.js';
 import { parseSnapshot, serializeSnapshot } from '../core/snapshot.js';
 import { PhaseExperiment, type ExperimentConfig } from '../core/experiment.js';
 import { PhysicsBridge } from '../worker/bridge.js';
+import type { PhysicsView } from '../core/physics-view.js';
 import {
   canvasToPng,
   downloadDataUrl,
@@ -70,7 +71,19 @@ const UI_SYNC_INTERVAL = 30;
  */
 export class App {
   readonly state = new AppState();
-  world: World;
+  /**
+   * Мир для ЧТЕНИЯ: настоящий или зеркало воркера.
+   *
+   * Тип — не `World`, а контракт `PhysicsView`. Это осознанно: у зеркала
+   * мутаторов нет и быть не должно, поэтому компилятор не даст случайно
+   * вызвать `this.world.step()` и посчитать физику в главном потоке, пока
+   * её считает воркер. Все изменения идут через `this.bridge`.
+   */
+  get world(): PhysicsView {
+    return this.bridge.world;
+  }
+  /** Мост: единственный путь к изменениям физики. */
+  readonly bridge: PhysicsBridge;
   renderer!: SceneRenderer;
   input!: InputController;
   session: LevelSession | null = null;
@@ -110,8 +123,25 @@ export class App {
   constructor(host: HTMLElement, app: Application) {
     this.host = host;
     this.app = app;
-    this.world = new World({ ...DEFAULT_PARAMS }, 20260214, 'fcc');
-    this.world.params.thermostat = 'berendsen';
+    const world = new World({ ...DEFAULT_PARAMS }, 20260214, 'fcc');
+    world.params.thermostat = 'berendsen';
+    this.bridge = new PhysicsBridge(world);
+  }
+
+  /**
+   * Попытаться перевести физику в воркер.
+   *
+   * Вызывается ПОСЛЕ построения интерфейса: если воркер не поднимется,
+   * приложение обязано остаться рабочим на локальном мире, и об этом надо
+   * сообщить, а не молча деградировать.
+   */
+  private enableWorkerIfPossible(): void {
+    if (!this.bridge.enableWorker()) {
+      const error = this.bridge.status().error ?? 'неизвестная причина';
+      console.info(`Физика считается в главном потоке: ${error}`);
+      return;
+    }
+    console.info('Физика вынесена в воркер');
   }
 
   /** Полная инициализация: сцена, интерфейс, цикл. */
@@ -134,6 +164,15 @@ export class App {
     });
 
     window.addEventListener('resize', () => this.resize());
+    /*
+     * Физика выносится в воркер ДО первого пресета.
+     *
+     * Порядок важен: `applyPreset` пересобирает систему, и если воркер
+     * поднимется после, пересборка уйдёт в локальный мир, а воркер получит
+     * уже другое состояние. Если воркер недоступен, приложение просто
+     * продолжит считать локально — об этом сообщается в консоль.
+     */
+    this.enableWorkerIfPossible();
     this.applyPreset(PRESETS[0], { silent: true });
     this.loop();
   }
@@ -330,27 +369,27 @@ export class App {
   private panelActions(): PanelActions {
     return {
       setTemperature: (value) => {
-        this.world.params.temperature = value;
+        this.bridge.setTemperature(value);
         this.notifyWorldChanged();
       },
       setDensity: (value) => {
-        this.world.setDensity(value);
+        this.bridge.setDensity(value);
         this.notifyWorldChanged();
       },
       setCount: (value) => {
-        this.world.resize(Math.round(value), this.world.params.density);
+        this.bridge.resize(Math.round(value), this.world.params.density, 'fcc');
         this.afterRebuild();
       },
       setThermostat: (value) => {
-        this.world.params.thermostat = value as WorldParams['thermostat'];
+        this.bridge.setThermostat(value);
         this.notifyWorldChanged();
       },
       setBoundary: (value) => {
-        this.world.params.boundary = value as WorldParams['boundary'];
+        this.bridge.setBoundary(value);
         this.notifyWorldChanged();
       },
       setLattice: (value) => {
-        this.world.requestRebuild(value as LatticeKind, true);
+        this.bridge.requestRebuild(value as LatticeKind, true);
         this.notifyWorldChanged();
       },
       setColorMode: (value) => {
@@ -395,19 +434,19 @@ export class App {
         this.state.autoSteps = value;
       },
       applyPreset: (preset) => this.applyPreset(preset),
-      heat: (factor) => this.world.scaleVelocities(factor),
-      cool: (factor) => this.world.scaleVelocities(factor),
-      freezeAll: () => this.world.freezeAll(),
-      unfreezeAll: () => this.world.unfreezeAll(),
-      applyTemperatureNow: () => this.world.applyTemperatureNow(),
+      heat: (factor) => this.bridge.scaleVelocities(factor),
+      cool: (factor) => this.bridge.scaleVelocities(factor),
+      freezeAll: () => this.bridge.freezeAll(),
+      unfreezeAll: () => this.bridge.unfreezeAll(),
+      applyTemperatureNow: () => this.bridge.applyTemperatureNow(),
       compress: (factor) => {
         const density = this.world.params.density / factor ** 3;
-        this.world.setDensity(density);
+        this.bridge.setDensity(density);
         this.syncControls();
       },
       expand: (factor) => {
         const density = this.world.params.density / factor ** 3;
-        this.world.setDensity(density);
+        this.bridge.setDensity(density);
         this.syncControls();
       },
       resetWorld: () => this.resetWorld(),
@@ -442,6 +481,9 @@ export class App {
     if (this.experiment) {
       this.experiment = null;
       this.state.experimentRunning = false;
+      // Возвращаем для чтения основной мир: иначе сцена осталась бы на
+      // последнем кадре свипа, и «Пуск» не давал бы видимого эффекта.
+      this.bridge.restoreReadingWorld();
       this.experimentPanel?.setProgress(0, 'остановлен');
       this.updateExperimentButton();
       return;
@@ -452,8 +494,10 @@ export class App {
       density: this.world.params.density,
       branch: this.experimentBranch,
     });
-    // Подменяем мир: сцена и графики должны показывать именно его.
-    this.world = this.experiment.simulation;
+    // Показываем мир эксперимента: сцена и графики должны рисовать именно
+    // его. Основной мир (в том числе мир воркера) при этом не трогается —
+    // мост вернёт его, когда свип закончится.
+    this.bridge.showWorldForReading(this.experiment.simulation);
     this.state.experimentRunning = true;
     this.paused = false;
     this.state.running = true;
@@ -504,6 +548,8 @@ export class App {
         this.updateExperimentButton();
         this.experiment = null;
         this.state.experimentRunning = false;
+        // Свип закончился — возвращаем сцену на основной мир.
+        this.bridge.restoreReadingWorld();
       }
       return;
     }
@@ -530,8 +576,22 @@ export class App {
 
   /** Сохранить состояние мира в JSON-файл. */
   private saveState(): void {
-    const text = serializeSnapshot(this.world.snapshot());
-    downloadText(timestampedName('phys-lab-состояние', 'json'), text, 'application/json;charset=utf-8');
+    /*
+     * Снимок берётся ЧЕРЕЗ МОСТ, а не у мира напрямую.
+     *
+     * В режиме воркера мира в главном потоке нет — есть только зеркало
+     * последнего кадра, из которого полное состояние (генератор случайных
+     * чисел, опорные координаты) не восстановить. Поэтому снимок
+     * запрашивается у воркера и приходит отдельным событием.
+     */
+    void this.bridge.requestSnapshot().then((text) => {
+      downloadText(
+        timestampedName('phys-lab-состояние', 'json'),
+        text,
+        'application/json;charset=utf-8',
+      );
+      this.showNotice('Состояние сохранено');
+    });
   }
 
   /** Открыть диалог выбора файла состояния. */
@@ -549,12 +609,18 @@ export class App {
   private async loadStateFile(file: File): Promise<void> {
     try {
       const text = await file.text();
+      // Проверка снимка идёт здесь, а восстановление — через мост: в режиме
+      // воркера восстанавливать должен он, иначе состояние разъедется.
       const parsed = parseSnapshot(text);
       if (!parsed.ok) {
         this.showNotice(`Не удалось загрузить: ${parsed.error}`, true);
         return;
       }
-      this.world.restore(parsed.loaded);
+      const error = this.bridge.restoreJson(text);
+      if (error) {
+        this.showNotice(`Не удалось загрузить: ${error}`, true);
+        return;
+      }
       this.session = null;
       this.state.levelId = null;
       this.campaign.showSandbox();
@@ -668,7 +734,16 @@ export class App {
 
   /** Применение пресета: параметры, решётка, короткий отжиг. */
   applyPreset(preset: Preset, options: { silent?: boolean } = {}): void {
-    this.world.params = {
+    /*
+     * Пресет применяется ЧЕРЕЗ МОСТ и одним вызовом.
+     *
+     * В локальном режиме это набор параметров плюс пересборка. В режиме
+     * воркера — те же действия командами. Отдельный метод нужен потому, что
+     * пресет задаёт параметры ЦЕЛИКОМ: если слать их по одному, воркер
+     * успеет сделать шаг в промежуточном состоянии (например, с новой
+     * температурой, но старой плотностью).
+     */
+    const params: Partial<WorldParams> = {
       ...DEFAULT_PARAMS,
       count: preset.count,
       density: preset.density,
@@ -680,10 +755,13 @@ export class App {
       thermostatTau: preset.thermostatTau,
       friction: preset.friction,
     };
-    this.world.resize(preset.count, preset.density, preset.lattice);
-    // Отжиг: прогоняем систему до равновесия, чтобы картинка соответствовала
-    // описанию пресета сразу, а не через минуту ручной работы.
-    if (preset.equilibrate > 0) this.world.run(preset.equilibrate);
+    this.bridge.applyParamsAndResize(
+      params,
+      preset.count,
+      preset.density,
+      preset.lattice,
+      preset.equilibrate,
+    );
 
     this.state.presetId = preset.id;
     if (!options.silent) this.presetHighlight(preset.id);
@@ -696,13 +774,12 @@ export class App {
 
   /** Пересборка текущей конфигурации с нуля. */
   private resample(): void {
-    this.world.rebuild('fcc', true);
+    this.bridge.rebuild('fcc', true);
     this.afterRebuild();
   }
 
   private resetWorld(): void {
-    this.world.resize(this.world.state.count, this.world.params.density, 'fcc');
-    this.world.params.temperature = this.world.params.temperature;
+    this.bridge.resize(this.world.state.count, this.world.params.density, 'fcc');
     this.afterRebuild();
   }
 
@@ -715,7 +792,7 @@ export class App {
   }
 
   private stepOnce(): void {
-    this.world.step();
+    this.bridge.advance(1);
     this.sampleIfDue(true);
     this.updateHud();
     this.flashStepButton();
@@ -746,7 +823,7 @@ export class App {
     // Импульс НАКАПЛИВАЕТСЯ в мире и применяется один раз за кадр: за кадр
     // мышь присылает несколько событий, и «последнее побеждает» сделало бы
     // толчок зависимым от частоты событий устройства, а не от протяжки.
-    this.world.requestPoke({
+    this.bridge.requestPoke({
       plane: this.brushPlane(screenX, screenY),
       dx: worldDx,
       dy: worldDy,
@@ -777,11 +854,11 @@ export class App {
   }
 
   private freezeAt(px: number, py: number): void {
-    this.world.freezeRegion(this.brushPlane(px, py), this.input.brushRadius);
+    this.bridge.freezeRegion(this.brushPlane(px, py), this.input.brushRadius);
   }
 
   private unfreezeAt(_px: number, _py: number): void {
-    this.world.unfreezeAll();
+    this.bridge.unfreezeAll();
   }
 
   /* ------------------------------------------------------------------ */
@@ -791,7 +868,9 @@ export class App {
   /** Запуск уровня. */
   startLevel(level: Level): void {
     const setup = level.setup;
-    this.world.params = {
+    // Уровень, как и пресет, задаёт параметры ЦЕЛИКОМ и пересобирает систему:
+    // промежуточные состояния воркеру видеть незачем.
+    const params: Partial<WorldParams> = {
       ...DEFAULT_PARAMS,
       ...setup,
       count: setup.count ?? DEFAULT_PARAMS.count,
@@ -804,11 +883,25 @@ export class App {
       friction: setup.friction ?? DEFAULT_PARAMS.friction,
       boundary: setup.boundary,
     };
-    this.world.resize(this.world.params.count, this.world.params.density, setup.lattice);
+    this.bridge.applyParamsAndResize(
+      params,
+      params.count ?? DEFAULT_PARAMS.count,
+      params.density ?? DEFAULT_PARAMS.density,
+      setup.lattice,
+    );
     this.state.levelId = level.id;
     this.state.presetId = null;
     this.presetHighlight(null);
-    this.session = new LevelSession(level, this.world);
+    /*
+     * Сессия уровня работает с ЛОКАЛЬНЫМ миром.
+     *
+     * Это осознанное ограничение: проверки уровня читают историю измерений
+     * и накопленную статистику, а в режиме воркера в главном потоке есть
+     * только зеркало последнего кадра. Поэтому при запуске уровня физика
+     * возвращается в главный поток, и кампания работает как раньше.
+     */
+    this.bridge.disableWorker();
+    this.session = new LevelSession(level, this.bridge.localWorld);
     this.paused = false;
     this.state.running = true;
     const btn = need<HTMLButtonElement>('[data-action="run"]', this.host);
@@ -828,7 +921,7 @@ export class App {
   /** Немедленная проверка уровня (кнопка «Проверить»). */
   checkLevel(): LevelReport | null {
     if (!this.session) return null;
-    const report = this.session.checkNow(this.world);
+    const report = this.session.checkNow(this.bridge.localWorld);
     this.campaign.showLevel(this.session.level, report, this.session.progress);
     if (report.passed) {
       this.campaign.markCompleted(this.session.level.id);
@@ -846,6 +939,23 @@ export class App {
     const target = 1000 / Math.max(1, this.state.targetFps);
     const elapsed = frameStart - this.lastFrame;
 
+    /*
+     * Свежий кадр от воркера — ДО всего остального.
+     *
+     * Порядок принципиален: сначала забираем то, что воркер успел посчитать,
+     * и только потом заказываем новую порцию шагов. Если поменять местами,
+     * отрисовка всегда показывала бы состояние на один кадр старше, а
+     * измерения читались бы дважды за один и тот же момент.
+     *
+     * В локальном режиме метод ничего не делает и стоит одного сравнения.
+     */
+    if (this.experiment) {
+      // Во время свипа сцена показывает мир эксперимента, а он считается
+      // локально: кадры воркера здесь не нужны и только мешали бы.
+    } else {
+      this.bridge.sync();
+    }
+
     if (this.experiment) {
       // Режим эксперимента: обычная симуляция уступает время свипу.
       // Физика внутри свипа своя, поэтому `stepsPerFrame` здесь не при чём.
@@ -855,10 +965,17 @@ export class App {
       this.lastFrame = frameStart;
       const steps = Math.max(1, this.state.stepsPerFrame);
       const physicsStart = performance.now();
-      for (let i = 0; i < steps; i++) {
-        this.world.step();
-        this.tickSession();
-      }
+      /*
+       * Шаги идут ЧЕРЕЗ МОСТ.
+       *
+       * В локальном режиме это обычный цикл `world.step()`. В режиме воркера
+       * `bridge.advance` только ЗАКАЗЫВАЕТ шаги и возвращается сразу —
+       * ждать их синхронно значило бы потерять весь смысл воркера. Поэтому
+       * `physicsMs` здесь измеряет время заказа, а не расчёта; реальную
+       * стоимость видно по частоте кадров и по `timings()`.
+       */
+      this.bridge.advance(steps);
+      for (let i = 0; i < steps; i++) this.tickSession();
       this.physicsMs = performance.now() - physicsStart;
       // Кадр статистики g(r) считается ПОСЛЕ замера шага.
       //
@@ -875,7 +992,7 @@ export class App {
       // протяжка не давала бы никакого отклика, и игрок не увидел бы, куда
       // попал. Заявка ограничена одной на кадр, поэтому «тыканье» на паузе
       // остаётся управляемым.
-      this.world.flushPoke();
+      this.bridge.flushPoke();
     }
 
     const drawn = this.renderer.render(this.world, this.input.brush.active ? this.input.brush : null);
@@ -897,7 +1014,7 @@ export class App {
 
   private tickSession(): void {
     if (!this.session) return;
-    const report = this.session.tick(this.world);
+    const report = this.session.tick(this.bridge.localWorld);
     if (report && this.uiCounter % 4 === 0) {
       this.campaign.showLevel(this.session.level, report, this.session.progress);
       if (report.passed) {
@@ -913,7 +1030,7 @@ export class App {
     this.radialCounter += stepsTaken;
     if (force || this.radialCounter >= this.radialEvery) {
       this.radialCounter = 0;
-      this.world.sampleRadial();
+      this.bridge.sampleRadial();
     }
   }
 
@@ -983,9 +1100,6 @@ export class App {
 
   private updateHud(): void {
     const m = this.world.measurement;
-    // Сеть связей строится лениво и кэшируется до следующего шага физики,
-    // поэтому её можно спросить и здесь: лишнего обхода пар не будет.
-    const bonds = this.world.bondNetwork();
     const diffusion = this.world.diffusion();
     const rows: Array<[string, string]> = [
       ['частиц', format.int(m.count)],
@@ -995,8 +1109,8 @@ export class App {
       ['E пот', format.energy(this.world.potentialEnergy)],
       ['E полн', format.energy(m.total)],
       ['P*', format.value(m.pressure, 2)],
-      ['связей/атом', format.value(bonds.meanCoordination(this.world.state), 2)],
-      ['разброс связей', format.value(bonds.lengthSpread(), 3)],
+      ['связей/атом', format.value(this.world.coordination, 2)],
+      ['разброс связей', format.value(this.world.bondSpread, 3)],
       ['D (диффузия)', this.diffusionLabel(diffusion.D)],
       ['пик g(r)', format.value(this.world.orderPeak, 2)],
       ['пик S(k)', format.value(this.world.structure.firstPeak().height, 2)],
@@ -1179,7 +1293,15 @@ export class App {
   /** Доступ для сквозных проверок и скриптов витрины. */
   api(): PhysLabApi {
     return {
-      world: this.world,
+      /*
+       * Скрипты проверки получают ЛОКАЛЬНЫЙ мир (`World`), а не зеркало.
+       *
+       * Это осознанно: smoke и showcase вызывают `resize`, `sampleRadial`,
+       * `pokeNow` — то есть меняют физику, и должны видеть последствия
+       * немедленно. Через зеркало это было бы невозможно: оно только для
+       * чтения. Режим воркера проверяется ОТДЕЛЬНО, через `workerSelfTest`.
+       */
+      world: this.bridge.localWorld,
       state: this.state,
       renderer: this.renderer,
       input: this.input,
@@ -1199,29 +1321,36 @@ export class App {
           return Boolean(preset);
         },
         setTemperature: (value: number) => {
-          this.world.params.temperature = value;
+          this.bridge.setTemperature(value);
           this.syncControls();
         },
         setDensity: (value: number) => {
-          this.world.setDensity(value);
+          this.bridge.setDensity(value);
           this.syncControls();
         },
         setThermostat: (value: string) => {
-          this.world.params.thermostat = value as WorldParams['thermostat'];
+          this.bridge.setThermostat(value);
           this.syncControls();
         },
         setBoundary: (value: string) => {
-          this.world.params.boundary = value as WorldParams['boundary'];
+          this.bridge.setBoundary(value);
           this.syncControls();
         },
         toggleRun: () => this.toggleRun(),
         stepOnce: () => this.stepOnce(),
         runSteps: (count: number) => {
-          for (let i = 0; i < count; i++) {
-            this.world.step();
+          /*
+           * Скрипты проверки гоняют шаги СИНХРОННО, и это правильно.
+           *
+           * В режиме воркера так нельзя: шаги там асинхронны, и «прогнать 200
+           * шагов и сразу прочитать результат» не сработает. Поэтому API
+           * проверок работает с локальным миром — см. комментарий к `world`
+           * в этом же объекте. Для проверки воркера есть `workerSelfTest`.
+           */
+          this.bridge.advanceLocal(count, () => {
             this.tickSession();
             this.sampleIfDue(false);
-          }
+          });
           this.updateHud();
           this.drawPlots();
         },
@@ -1229,14 +1358,14 @@ export class App {
         setBondRadius: (value: number) => {
           this.state.view.bondRadius = value;
           this.renderer.options.bondRadius = value;
-          this.world.bondNetwork(value);
+          this.bridge.setBondRadius(value);
         },
         setShowBonds: (value: boolean) => {
           this.state.view.showBonds = value;
           this.renderer.options.showBonds = value;
         },
         msdCsv: () => {
-          const curve = this.world.msdCurve();
+          const curve = this.bridge.localWorld.msdCurve();
           return { lag: Array.from(curve.lag), msd: Array.from(curve.msd) };
         },
         /**
@@ -1246,12 +1375,12 @@ export class App {
          * браузере не перехватить. Здесь тот же самый код сериализации, так
          * что проверяется он, а не «похожий».
          */
-        snapshotJson: () => serializeSnapshot(this.world.snapshot()),
+        snapshotJson: () => serializeSnapshot(this.bridge.localWorld.snapshot()),
         /** Загрузить состояние из JSON-строки. Возвращает текст ошибки или null. */
         restoreJson: (text: string) => {
           const parsed = parseSnapshot(text);
           if (!parsed.ok) return parsed.error;
-          this.world.restore(parsed.loaded);
+          this.bridge.localWorld.restore(parsed.loaded);
           this.afterRebuild();
           return null;
         },
@@ -1330,9 +1459,9 @@ export class App {
         time: this.world.time,
         steps: this.world.steps,
         box: this.world.box,
-        coordination: this.world.bondNetwork().meanCoordination(this.world.state),
+        coordination: this.world.coordination,
         bondPairs: this.world.bondNetwork().pairCount,
-        bondSpread: this.world.bondNetwork().lengthSpread(),
+        bondSpread: this.world.bondSpread,
         bondsDrawn: this.renderer.bondStatsSnapshot.drawn,
         diffusion: this.world.diffusion().D,
         diffusionR2: this.world.diffusion().r2,
@@ -1375,6 +1504,25 @@ export class App {
         return { msPerFrame: total / Math.max(1, frames), particles, bonds };
       },
       workerSelfTest: (steps?: number) => PhysicsBridge.selfTest(steps),
+      /**
+       * Вернуть физику в главный поток.
+       *
+       * Нужно инструментам проверки. Скрипты (smoke, showcase) МЕНЯЮТ мир:
+       * вызывают `resize`, `pokeNow`, `sampleRadial` и сразу читают
+       * результат. В режиме воркера это невозможно: изменения уходят
+       * асинхронно, а рендер показывает зеркало последнего кадра, то есть
+       * ДРУГОЙ мир. Проверять это было бы проверкой рассинхрона, а не
+       * физики.
+       *
+       * Поэтому скрипты явно переводят приложение в локальный режим и
+       * проверяют его как раньше, а работа воркера проверяется отдельно —
+       * методом `workerSelfTest`.
+       */
+      useLocalPhysics: () => {
+        this.bridge.disableWorker();
+      },
+      /** Где сейчас считается физика. */
+      physicsMode: () => this.bridge.status().mode,
     };
   }
 }
@@ -1486,4 +1634,13 @@ export interface PhysLabApi {
    * кадрами работает в реальной среде.
    */
   workerSelfTest(steps?: number): Promise<{ ok: boolean; error?: string; summary?: unknown }>;
+  /**
+   * Вернуть физику в главный поток — для инструментов проверки.
+   *
+   * Скрипты меняют мир синхронно и сразу читают результат; в режиме воркера
+   * это невозможно. Работа воркера проверяется отдельно, `workerSelfTest`.
+   */
+  useLocalPhysics(): void;
+  /** Где сейчас считается физика. */
+  physicsMode(): 'worker' | 'local';
 }

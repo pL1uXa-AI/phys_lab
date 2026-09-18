@@ -144,6 +144,7 @@ export class WorldMirror {
   readonly history: MirrorHistory;
   readonly radial: MirrorRadial;
   readonly structure: MirrorStructure;
+  readonly msd: { originCount: number };
   readonly orderPeak: number;
   readonly pairCount: number;
   readonly speedClampedCount: number;
@@ -226,6 +227,15 @@ export class WorldMirror {
         height: s.structurePeak,
       }),
     };
+    /*
+     * Число начал отсчёта MSD в кадр не передаётся.
+     *
+     * Оно нужно только подписи в панели («начал: 12») и ничего не решает в
+     * поведении, поэтому вместо него отдаём ноль — это честнее, чем
+     * выдумывать величину. Если подпись понадобится, число добавится в
+     * `FrameSummary` одной строкой.
+     */
+    this.msd = { originCount: 0 };
   }
 
   /** Готовая функция g(r). */

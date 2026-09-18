@@ -148,10 +148,7 @@ describe('протокол воркера: клиент', () => {
     expect(client.consume()).toBe(frame);
   });
 
-  it('consume возвращает буферы прошлого кадра воркеру', () => {
-    // Ключевая проверка обмена по владению: после `postMessage` с
-    // `Transferable` буфер отчуждён, и держать его в главном потоке
-    // бессмысленно — это утечка памяти на мегабайт в кадре.
+  it('consume возвращает буферы прошлого кадра, когда пришёл новый', () => {
     const { client, port } = makeClient();
     client.init({}, 1, 'fcc');
     port.reply({ type: 'ready', count: 10, box: 5 });
@@ -166,11 +163,56 @@ describe('протокол воркера: клиент', () => {
     client.consume();
     // Прошлый кадр вернулся ровно один раз.
     expect(port.ofType('recycle')).toHaveLength(1);
-    // И вернулись именно его буферы.
-    const recycle = port.ofType('recycle')[0] as unknown as Record<string, unknown>;
-    expect(recycle['x']).toBe(first.x);
-    const transfer = port.transfers[port.transfers.length - 1];
-    expect(transfer.length).toBeGreaterThan(10);
+  });
+
+  it('ПОВТОРНЫЙ consume без нового кадра НЕ возвращает буферы', () => {
+    /*
+     * Это тест на дефект, найденный только в браузере.
+     *
+     * `sync()` вызывается каждый кадр отрисовки, а воркер присылает новый
+     * кадр не каждый (на 20 000 частиц шаг дольше кадра экрана). Прежняя
+     * версия `consume` возвращала в пул «предыдущий» кадр, не проверяя,
+     * сменился ли он, — то есть отчуждала буферы ТОГО САМОГО кадра, который
+     * в этот момент читало зеркало. Падение выглядело как
+     * «Cannot perform Construct on a detached ArrayBuffer».
+     *
+     * Поэтому здесь проверяется именно ПОВТОРНЫЙ вызов без нового кадра:
+     * буферы не должны уйти воркеру, пока кадр не сменился.
+     */
+    const { client, port } = makeClient();
+    client.init({}, 1, 'fcc');
+    port.reply({ type: 'ready', count: 10, box: 5 });
+
+    const frame = localFrame(makeSyntheticWorld());
+    port.reply({ type: 'frame', payload: frame });
+    client.consume();
+    expect(port.ofType('recycle')).toHaveLength(0);
+
+    // Второй вызов подряд: нового кадра нет.
+    client.consume();
+    client.consume();
+    expect(port.ofType('recycle')).toHaveLength(0);
+
+    // А когда кадр действительно сменился — буферы уходят.
+    port.reply({ type: 'frame', payload: localFrame(makeSyntheticWorld()) });
+    client.consume();
+    expect(port.ofType('recycle')).toHaveLength(1);
+  });
+
+  it('stop обнуляет кадр: ссылки на отчуждённую память не остаётся', () => {
+    /*
+     * После передачи по владению буфер отчуждён, и обращение к нему падает.
+     * Если клиент хранит такой кадр после остановки, зеркало продолжит его
+     * читать — этим и была сломана легенда раскраски в браузере.
+     */
+    const { client, port } = makeClient();
+    client.init({}, 1, 'fcc');
+    port.reply({ type: 'ready', count: 10, box: 5 });
+    port.reply({ type: 'frame', payload: localFrame(makeSyntheticWorld()) });
+    client.consume();
+    client.stop();
+    expect(client.frame).toBeNull();
+    expect(client.lastFrame).toBeNull();
   });
 
   it('ошибка воркера видна в статусе, а не глотается', () => {

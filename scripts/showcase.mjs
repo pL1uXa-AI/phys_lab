@@ -256,6 +256,10 @@ async function main() {
       (() => {
         localStorage.setItem('phys-lab.seen-help', '1');
         for (const b of document.querySelectorAll('.modal-backdrop')) b.remove();
+        // Витрина меняет мир синхронно (пресеты, прогоны, статистика), а в
+        // режиме воркера это уходило бы асинхронно, и кадр показывал бы
+        // другое состояние. Возвращаем физику в главный поток.
+        window.__physLab.useLocalPhysics();
       })()
     `);
 
