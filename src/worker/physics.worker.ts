@@ -45,6 +45,52 @@ import {
 let world: World | null = null;
 
 /**
+ * Сколько шагов воркер выполнил за всё время.
+ *
+ * Счётчик МОНОТОННЫЙ и не сбрасывается пересборкой системы — в отличие от
+ * `world.steps`, который описывает текущую траекторию. По нему главный поток
+ * считает, сколько заказанных шагов ещё не сделано, и не даёт очереди расти
+ * бесконечно.
+ */
+let stepsExecuted = 0;
+
+/**
+ * Измеренная стоимость одного шага в миллисекундах.
+ *
+ * Нужна главному потоку для автоподстройки числа шагов: измерить её там
+ * невозможно — шаги идут в другом потоке, а `postMessage` возвращается сразу.
+ *
+ * ─── Почему замер идёт по ВСЕЙ команде, а не по циклу шагов ───────────────
+ *
+ * Первая версия мерила только цикл `w.step()`. Этого мало: после шагов тот
+ * же поток собирает кадр — строит сеть связей, копирует буферы, готовит
+ * кривые, — и на 2000 частиц это заметная доля времени. Из-за заниженной
+ * оценки автоподстройка считала, что порцию можно увеличивать, и очередь
+ * росла. Здесь измеряется обработка команды целиком, включая сборку кадра,
+ * то есть ровно то, что ограничивает пропускную способность воркера.
+ *
+ * Оценка сглажена экспоненциально: одиночный замер гуляет в разы из-за
+ * сборки мусора и планировщика.
+ */
+let stepCostMs = 0;
+
+/** Сглаживание оценки стоимости шага (доля нового замера). */
+const COST_SMOOTHING = 0.25;
+
+/** Выполнить шаги. Стоимость измеряется вызывающим — вместе со сборкой кадра. */
+function runSteps(w: World, steps: number): void {
+  for (let i = 0; i < steps; i++) w.step();
+  stepsExecuted += steps;
+}
+
+/** Учесть замер стоимости команды «run» вместе со сборкой кадра. */
+function accountStepCost(steps: number, measuredMs: number): void {
+  if (steps <= 0 || measuredMs <= 0) return;
+  const measured = measuredMs / steps;
+  stepCostMs = stepCostMs === 0 ? measured : stepCostMs * (1 - COST_SMOOTHING) + measured * COST_SMOOTHING;
+}
+
+/**
  * Набор буферов кадра.
  *
  * Тип задан через `FrameBuffersPayload` из протокола, а не через вычитание
@@ -205,8 +251,9 @@ function makeFrame(w: World): FramePayload {
     speedClamped: w.speedClampedCount,
     gridIsSafe: w.gridIsSafe,
     params: { ...w.params },
+    stepsExecuted,
+    stepCostMs,
   };
-
   return {
     ...buffers,
     bondCount: pairs,
@@ -273,6 +320,12 @@ self.onmessage = (event: MessageEvent<WorkerCommand>) => {
   }
 
   try {
+    /*
+     * Замер стоимости начинается ДО команды и заканчивается ПОСЛЕ отправки
+     * кадра: воркер последовательно считает шаги и собирает кадр, поэтому
+     * пропускную способность ограничивает именно эта сумма, а не одни шаги.
+     */
+    const commandStarted = performance.now();
     switch (command.type) {
       case 'configure':
         Object.assign(w.params, command.patch);
@@ -285,7 +338,7 @@ self.onmessage = (event: MessageEvent<WorkerCommand>) => {
         w.setDensity(command.density);
         break;
       case 'run':
-        for (let i = 0; i < command.steps; i++) w.step();
+        runSteps(w, command.steps);
         break;
       case 'applyTemperatureNow':
         w.applyTemperatureNow();
@@ -329,6 +382,9 @@ self.onmessage = (event: MessageEvent<WorkerCommand>) => {
         break;
     }
     emitFrame();
+    if (command.type === 'run') {
+      accountStepCost(command.steps, performance.now() - commandStarted);
+    }
   } catch (error) {
     emit({ type: 'error', message: `Ошибка команды ${command.type}: ${(error as Error).message}` });
   }

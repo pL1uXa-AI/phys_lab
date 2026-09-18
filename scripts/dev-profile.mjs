@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Профиль кадра: физика против отрисовки.
  *
  * Отвечает на вопрос, который нельзя решить рассуждением: что именно
@@ -290,6 +290,68 @@ async function main() {
         `  без связей: ${toggle.without.toFixed(2)} мс\n` +
         `  вклад связей: ${(toggle.withBonds - toggle.without).toFixed(2)} мс`,
     );
+
+    /*
+     * Пропускная способность воркера в зависимости от порции.
+     *
+     * Зачем это мерить. Автоподстройка числа шагов в режиме воркера выбирает
+     * размер порции. Наивное «сколько шагов укладывается в кадр» неверно:
+     * замерено, что после 16 шагов пропускная способность воркера падает
+     * втрое — очередь заказов перестаёт разгружаться. Без этих чисел граница
+     * порции была бы догадкой, а с ними она проверяема.
+     */
+    console.log('\nПропускная способность воркера: порция → шагов в секунду (N = 2048)');
+    const curve = await client.eval(
+      `
+      (async () => {
+        const app = window.__physLab;
+        if (app.physicsMode() !== 'worker') return null;
+        app.state.autoSteps = false;
+        app.actions.applyPreset('liquid');
+        const rows = [];
+        for (const batch of [1, 2, 4, 8, 16, 32, 48]) {
+          app.state.stepsPerFrame = batch;
+          await new Promise((r) => setTimeout(r, 3500));
+          const row = await new Promise((resolve) => {
+            const a0 = app.workerDiagnostics();
+            const t0 = performance.now();
+            let frames = 0;
+            const tick = () => {
+              frames++;
+              if (performance.now() - t0 < 3000) requestAnimationFrame(tick);
+              else {
+                const dt = (performance.now() - t0) / 1000;
+                resolve({
+                  batch: app.state.stepsPerFrame,
+                  rate: (app.workerDiagnostics().stepsExecuted - a0.stepsExecuted) / dt,
+                  fps: frames / dt,
+                  cost: app.workerDiagnostics().stepCostMs,
+                  backlog: app.workerDiagnostics().backlog,
+                });
+              }
+            };
+            requestAnimationFrame(tick);
+          });
+          rows.push(row);
+        }
+        app.state.autoSteps = true;
+        return rows;
+      })()
+    `,
+      600000,
+    );
+    if (curve) {
+      for (const row of curve) {
+        console.log(
+          `  порция ${String(row.batch).padStart(2)}: ${row.rate.toFixed(0).padStart(4)} шаг/с` +
+            `, ${row.fps.toFixed(1).padStart(5)} кадр/с, шаг ${row.cost.toFixed(2)} мс, отставание ${row.backlog}`,
+        );
+      }
+      const best = curve.reduce((a, b) => (b.rate > a.rate ? b : a));
+      console.log(`  максимум: ${best.rate.toFixed(0)} шаг/с при порции ${best.batch}`);
+    } else {
+      console.log('  пропущено: физика считается локально, воркер не поднят');
+    }
   } finally {
     child.kill();
   }
@@ -299,3 +361,4 @@ main().catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });
+

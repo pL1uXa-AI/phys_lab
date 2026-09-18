@@ -162,9 +162,21 @@ export function rangeControl(options: {
   value: number;
   format?: (value: number) => string;
   onInput: (value: number) => void;
+  /**
+   * Вызывается, когда пользователь ОТПУСТИЛ ползунок.
+   *
+   * Нужен там, где реакция на каждое движение мыши слишком дорога: смена
+   * числа частиц пересобирает систему целиком, и протяжка ползунка — это
+   * десятки пересборок подряд. Каждая из них обнуляет историю и шаги, из-за
+   * чего графики «сбрасывались» на глазах. С этим колбэком дорогое действие
+   * выполняется один раз, а во время протяжки обновляется только подпись.
+   */
+  onCommit?: (value: number) => void;
 }): RangeControl {
   const format = options.format ?? ((v: number) => String(v));
   const output = h('output', { class: 'field__value' }, format(options.value));
+  const read = (target: EventTarget | null): number =>
+    Number((target as HTMLInputElement).value);
   const input = h('input', {
     class: 'range',
     type: 'range',
@@ -174,10 +186,16 @@ export function rangeControl(options: {
     value: options.value,
     on: {
       input: (event: Event) => {
-        const value = Number((event.target as HTMLInputElement).value);
+        const value = read(event.target);
         output.textContent = format(value);
         options.onInput(value);
       },
+      // `change` в браузере наступает по окончании протяжки, `pointerup` и
+      // `keyup` — для клавиатуры и синтетических событий, где `change` может
+      // не прийти вовсе.
+      change: (event: Event) => options.onCommit?.(read(event.target)),
+      pointerup: (event: Event) => options.onCommit?.(read(event.target)),
+      keyup: (event: Event) => options.onCommit?.(read(event.target)),
     },
   });
   const root = h(

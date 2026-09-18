@@ -22,6 +22,18 @@ export interface PanelActions {
   setTemperature(value: number): void;
   setDensity(value: number): void;
   setCount(value: number): void;
+  /**
+   * Смена числа частиц ЗАВЕРШЕНА (ползунок отпущен).
+   *
+   * Смена числа частиц пересобирает систему целиком: это десятки
+   * миллисекунд, и каждая пересборка обнуляет шаги, историю и накопленную
+   * статистику. Выполнять её на каждое событие протяжки нельзя — графики
+   * «сбрасываются» на глазах, а очередь команд у воркера растёт быстрее,
+   * чем он успевает считать. Поэтому дорогое действие вынесено сюда.
+   */
+  commitCount(value: number): void;
+  /** Смена плотности ЗАВЕРШЕНА (ползунок отпущен). */
+  commitDensity(value: number): void;
   setThermostat(value: string): void;
   setBoundary(value: string): void;
   setLattice(value: LatticeKind): void;
@@ -136,6 +148,7 @@ export function worldPanel(actions: PanelActions, initial: {
     value: initial.density,
     format: (v) => v.toFixed(2),
     onInput: actions.setDensity,
+    onCommit: actions.commitDensity,
   });
   const count = rangeControl({
     // ГЦК-решётка округляет число до 4n³, поэтому фактическое число частиц
@@ -147,6 +160,7 @@ export function worldPanel(actions: PanelActions, initial: {
     value: initial.count,
     format: (v) => Math.round(v).toLocaleString('ru-RU'),
     onInput: actions.setCount,
+    onCommit: actions.commitCount,
   });
   const thermostat = toggleControl({
     label: 'Термостат',

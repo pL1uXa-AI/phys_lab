@@ -401,6 +401,8 @@ export function localFrame(world: World): FramePayload {
       speedClamped: world.speedClampedCount,
       gridIsSafe: world.gridIsSafe,
       params: { ...world.params },
+      stepsExecuted: world.steps,
+      stepCostMs: 0,
     },
   };
 }

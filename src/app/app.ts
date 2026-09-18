@@ -67,6 +67,15 @@ const RADIAL_INTERVAL = 40;
 const UI_SYNC_INTERVAL = 30;
 
 /**
+ * Задержка перед дорогой пересборкой системы.
+ *
+ * Ползунок числа частиц приходит десятками событий за протяжку, а каждое
+ * такое событие пересобирает систему и обнуляет статистику. 200 мс — это
+ * ещё «живая» реакция, но уже не поток пересборок.
+ */
+const REBUILD_DELAY_MS = 200;
+
+/**
  * Приложение целиком.
  */
 export class App {
@@ -105,6 +114,28 @@ export class App {
   /** Выбранная ветвь свипа. */
   private experimentBranch: 'heating' | 'cooling' = 'heating';
   private experimentPanel: { setProgress(progress: number, phase: string): void } | null = null;
+  /** Отложенная пересборка: что применить и таймеры ожидания. */
+  private pendingCount: number | null = null;
+  private pendingDensity: number | null = null;
+  private countTimer = 0;
+  private densityTimer = 0;
+  /**
+   * Чего игрок ждёт от ползунков.
+   *
+   * В режиме воркера зеркало отстаёт на кадр, и синхронизация по нему
+   * откатывала бы только что выбранное значение. Пока мир не подтвердил
+   * заказ, показываем именно заказанное.
+   */
+  private desiredCount: number | null = null;
+  private desiredDensity: number | null = null;
+  /** Интервал между кадрами для честной подписи частоты кадров. */
+  private frameIntervalMs = 0;
+  /** Предыдущая точка замера скорости шагов. */
+  private stepRateMark: { time: number; executed: number } | null = null;
+  /** Последняя оценка скорости шагов — чтобы подпись не мигала нулём. */
+  private lastStepRate = 0;
+  /** Момент предыдущего кадра — для честной частоты кадров. */
+  private lastFrameTick = 0;
 
   /** Ссылки на панели и их управляющие элементы для синхронизации. */
   private bindings: Partial<ReturnType<typeof worldPanel>['bindings']> = {};
@@ -373,13 +404,28 @@ export class App {
         this.notifyWorldChanged();
       },
       setDensity: (value) => {
-        this.bridge.setDensity(value);
-        this.notifyWorldChanged();
+        /*
+         * Плотность меняет ящик без пересборки решётки, но тоже сбрасывает
+         * историю и g(r) (см. `World.setDensity`). Поэтому и здесь протяжка
+         * только показывает значение, а применяется оно после паузы.
+         */
+        this.scheduleDensityChange(value);
       },
+      commitDensity: (value) => this.applyDensityNow(value),
       setCount: (value) => {
-        this.bridge.resize(Math.round(value), this.world.params.density, 'fcc');
-        this.afterRebuild();
+        /*
+         * Протяжка ползунка числа частиц НЕ пересобирает систему.
+         *
+         * Пересборка — это десятки миллисекунд, и она обнуляет шаги, историю
+         * измерений и накопленные g(r)/S(k)/MSD. Раньше она запускалась на
+         * каждое событие движения мыши: игрок тянул ползунок — графики
+         * «сбрасывались» десятки раз подряд, а у воркера копилась очередь
+         * пересборок. Теперь во время протяжки обновляется только подпись,
+         * а сама пересборка выполняется один раз после паузы.
+         */
+        this.scheduleCountRebuild(value);
       },
+      commitCount: (value) => this.applyCountNow(value),
       setThermostat: (value) => {
         this.bridge.setThermostat(value);
         this.notifyWorldChanged();
@@ -726,6 +772,64 @@ export class App {
     this.state.notify();
   }
 
+  /**
+   * Отложенная пересборка под новое число частиц.
+   *
+   * Пока игрок тянет ползунок, команда не отправляется: подпись уже
+   * обновлена обработчиком `input`, а система пересобирается один раз —
+   * после короткой паузы. Задержка мала (200 мс), поэтому реакция остаётся
+   * «живой», но десятки пересборок подряд исчезают.
+   */
+  private scheduleCountRebuild(value: number): void {
+    const count = Math.round(value);
+    this.pendingCount = count;
+    window.clearTimeout(this.countTimer);
+    this.countTimer = window.setTimeout(() => {
+      if (this.pendingCount === null) return;
+      const target = this.pendingCount;
+      this.pendingCount = null;
+      this.applyCountNow(target);
+    }, REBUILD_DELAY_MS);
+  }
+
+  /** Применить новое число частиц немедленно. */
+  private applyCountNow(value: number): void {
+    const count = Math.round(value);
+    // Повторная пересборка на то же число не нужна: она лишь сбросила бы
+    // накопленную статистику без всякой пользы.
+    if (count === this.world.state.count) return;
+    window.clearTimeout(this.countTimer);
+    this.pendingCount = null;
+    this.desiredCount = count;
+    this.bridge.resize(count, this.world.params.density, 'fcc');
+    this.afterRebuild();
+  }
+
+  /** Отложенная смена плотности — по той же причине, что и числа частиц. */
+  private scheduleDensityChange(value: number): void {
+    this.pendingDensity = value;
+    window.clearTimeout(this.densityTimer);
+    this.densityTimer = window.setTimeout(() => {
+      if (this.pendingDensity === null) return;
+      const target = this.pendingDensity;
+      this.pendingDensity = null;
+      this.applyDensityNow(target);
+    }, REBUILD_DELAY_MS);
+  }
+
+  /** Применить новую плотность немедленно. */
+  private applyDensityNow(value: number): void {
+    window.clearTimeout(this.densityTimer);
+    this.pendingDensity = null;
+    if (Math.abs(value - this.world.params.density) < 1e-9) return;
+    this.desiredDensity = value;
+    this.bridge.setDensity(value);
+    // Подпись синхронизируется сразу: значение уже принято, и ждать
+    // следующего кадра воркера незачем — иначе ползунок «отпрыгнет» назад.
+    this.syncControls();
+    this.state.notify();
+  }
+
   private afterRebuild(): void {
     this.renderer.camera.fit(this.world.box, this.app.renderer.width, this.app.renderer.height);
     this.syncControls();
@@ -792,7 +896,9 @@ export class App {
   }
 
   private stepOnce(): void {
-    this.bridge.advance(1);
+    // `force`: одиночный шаг — дискретное действие игрока, и он обязан
+    // выполниться даже если воркер ещё считает предыдущую порцию.
+    this.bridge.advance(1, true);
     this.sampleIfDue(true);
     this.updateHud();
     this.flashStepButton();
@@ -936,6 +1042,8 @@ export class App {
 
   private loop = (): void => {
     const frameStart = performance.now();
+    if (this.lastFrameTick > 0) this.frameIntervalMs = frameStart - this.lastFrameTick;
+    this.lastFrameTick = frameStart;
     const target = 1000 / Math.max(1, this.state.targetFps);
     const elapsed = frameStart - this.lastFrame;
 
@@ -1004,6 +1112,14 @@ export class App {
       this.updateHud();
       this.drawPlots();
       this.updateLegendValues();
+      /*
+       * Ползунки подтягиваются из мира.
+       *
+       * Без этого они залипали на значении, снятом один раз при пересборке:
+       * в режиме воркера зеркало в тот момент ещё старое, поэтому число
+       * частиц показывалось прежним (2048 вместо 4000) уже навсегда.
+       */
+      this.syncControls();
     }
     this.updateFps(frameStart);
     this.autoTuneSteps();
@@ -1063,25 +1179,100 @@ export class App {
    */
   private autoTuneSteps(): void {
     if (!this.state.autoSteps) return;
-    // Бюджет физики на кадр. При 8 шагах и цели 60 кадров/с это 10 мс —
-    // примерно шестая часть кадра, остальное достаётся отрисовке и браузеру.
-    const budget = 10;
-    const perStep = this.physicsMs / Math.max(1, this.state.stepsPerFrame);
-    if (perStep <= 0 || !Number.isFinite(perStep)) return;
     const now = performance.now();
     if (now - this.lastAutoTune < 500) return;
     this.lastAutoTune = now;
-
+    if (this.bridge.usingWorker) {
+      this.autoTuneWorkerSteps();
+      return;
+    }
+    /*
+     * Локальный режим: физика считается ПРЯМО В КАДРЕ, поэтому её надо
+     * уложить в бюджет времени. При 8 шагах и цели 60 кадров/с это 10 мс —
+     * примерно шестая часть кадра, остальное достаётся отрисовке и браузеру.
+     */
+    const budget = 10;
+    const perStep = this.physicsMs / Math.max(1, this.state.stepsPerFrame);
+    if (perStep <= 0 || !Number.isFinite(perStep)) return;
     const ideal = Math.max(1, Math.min(40, Math.floor(budget / perStep)));
     if (ideal > this.state.stepsPerFrame && this.physicsMs < budget * 0.7) {
-      this.state.stepsPerFrame++;
-      this.bindings.stepsPerFrame?.set(this.state.stepsPerFrame);
-      this.state.notify();
+      this.setStepsPerFrame(this.state.stepsPerFrame + 1);
     } else if (ideal < this.state.stepsPerFrame && this.physicsMs > budget) {
-      this.state.stepsPerFrame = Math.max(1, this.state.stepsPerFrame - 1);
-      this.bindings.stepsPerFrame?.set(this.state.stepsPerFrame);
-      this.state.notify();
+      this.setStepsPerFrame(this.state.stepsPerFrame - 1);
     }
+  }
+
+  /**
+   * Автоподстройка числа шагов в режиме воркера.
+   *
+   * ─── Почему здесь нельзя мерить время кадра, как в локальном режиме ──────
+   *
+   * В локальном режиме физика блокирует кадр, поэтому её укладывают в бюджет:
+   * это и делает ветка выше. В режиме воркера физика кадр НЕ блокирует —
+   * главный поток лишь отправляет команду. Первая версия перенесла сюда тот
+   * же бюджет и стала мерить стоимость `postMessage` (доли миллисекунды):
+   * число шагов на кадр уползало к 21 и выше, воркер не успевал, очередь
+   * росла, а «Пауза» перестала останавливать движение. Это и была жалоба на
+   * «просевший FPS».
+   *
+   * ─── Что здесь на самом деле нужно ───────────────────────────────────────
+   *
+   * Заказать ровно столько шагов, чтобы воркер был занят примерно один кадр.
+   * Меньше — воркер простаивает, система считается медленнее, чем может.
+   * Больше — очередь растёт, и картинка отстаёт от действий игрока.
+   *
+   * Величины для этого есть: интервал кадров измеряет главный поток, а
+   * стоимость шага — сам воркер (из главного потока её не видно). Отсюда
+   * порция:
+   *
+   *     шагов на кадр = интервал кадра / стоимость шага
+   *
+   * Замерено на 2048 частицах (`scripts/dev-profile.mjs`, порция фиксирована):
+   * при 8–16 шагах воркер выдаёт ~190 шаг/с, при 32 и выше пропускная
+   * способность падает втрое, потому что заказы начинают блокироваться
+   * очередью. Формула как раз держит порцию в рабочей зоне.
+   */
+  private autoTuneWorkerSteps(): void {
+    const stepCost = this.bridge.stepCostMs;
+    if (stepCost <= 0) return;
+    // До первого измерения интервала ориентируемся на 60 кадров/с.
+    const frameMs = this.frameIntervalMs > 0 ? this.frameIntervalMs : 1000 / 60;
+    /*
+     * Верхняя граница порции — 16, и это ИЗМЕРЕННАЯ величина.
+     *
+     * В `scripts/dev-profile.mjs` порция задавалась вручную, и пропускная
+     * способность воркера оказалась такой (N = 2048):
+     *
+     *     порция:   1     2     4     8     16    32    48
+     *     шаг/с:   18    33    67   142   190    84    31
+     *
+     * То есть после 16 шагов пропускная способность падает втрое: очередь
+     * заказов перестаёт разгружаться, и воркер начинает тратить время на
+     * разбор отставания, а не на физику. Формула `кадр / стоимость шага` в
+     * медленном окружении (софтверный рендер, длинный кадр) даёт 26 и
+     * попадает ровно в провал. Поэтому результат формулы ограничивается
+     * значением из этой таблицы.
+     */
+    const MAX_WORKER_BATCH = 16;    const target = Math.min(MAX_WORKER_BATCH, Math.max(1, Math.round(frameMs / stepCost)));
+    /*
+     * Приближение к цели — по одному шагу за замер.
+     *
+     * Прыжок сразу к расчётному значению дал бы автоколебания: в оценку
+     * стоимости входит и сборка кадра, поэтому она зависит от самой порции.
+     * Медленное движение (раз в 500 мс) гасит эту обратную связь.
+     */
+    const current = this.state.stepsPerFrame;
+    if (target > current) this.setStepsPerFrame(current + 1);
+    else if (target < current) this.setStepsPerFrame(current - 1);
+  }
+
+  /** Выставить число шагов на кадр и обновить ползунок в панели. */
+  private setStepsPerFrame(value: number): void {
+    const clamped = Math.max(1, Math.min(40, Math.round(value)));
+    if (clamped === this.state.stepsPerFrame) return;
+    this.state.stepsPerFrame = clamped;
+    this.bindings.stepsPerFrame?.set(clamped);
+    this.state.notify();
   }
 
   private updateFps(frameStart: number): void {
@@ -1094,8 +1285,62 @@ export class App {
       field.textContent = `пауза · шаг ${this.world.steps}`;
       return;
     }
-    const total = this.physicsMs + this.drawMs;
-    field.textContent = `${(1000 / Math.max(1, total)).toFixed(0)} расч/с · шаг ${this.world.steps}`;
+    /*
+     * ─── Почему подпись считается именно так ────────────────────────────────
+     *
+     * Раньше здесь стояло `1000 / (physicsMs + drawMs)`. В локальном режиме
+     * это осмысленно, но в режиме воркера `physicsMs` — только время отправки
+     * сообщения: сам расчёт идёт в другом потоке. Подпись показывала «294
+     * расч/с», хотя счётчик шагов рядом вырастал за секунду примерно на 300,
+     * а кадров интерфейса было около 15. Человек видел противоречие и решал,
+     * что сломаны и счётчик, и производительность.
+     *
+     * Поэтому показываются две ЧЕСТНЫЕ величины: реальная частота кадров
+     * (по интервалу между кадрами) и фактическая скорость шагов физики
+     * (по приросту подтверждённых воркером шагов).
+     */
+    const interval = this.frameIntervalMs;
+    const fps = interval > 0 ? 1000 / interval : 0;
+    const perSecond = this.measureStepRate();
+    field.textContent = `${fps.toFixed(0)} кадр/с · ${perSecond.toFixed(0)} шаг/с · всего ${this.world.steps}`;
+  }
+
+  /**
+   * Фактическая скорость шагов физики, шагов в секунду.
+   *
+   * Считается по приросту монотонного счётчика выполненного: в режиме
+   * воркера это единственная величина, которая отражает реальный расчёт,
+   * а не темп отправки команд.
+   *
+   * ─── Почему точка замера двигается не каждый кадр ────────────────────────
+   *
+   * Воркер присылает кадр не каждый кадр отрисовки (на 2048 частицах — реже).
+   * Если пересчитывать скорость на каждом кадре, то между кадрами воркера
+   * прирост равен нулю, и подпись мигала бы «0 шаг/с» — то есть врала ровно
+   * в тот момент, когда система работает нормально. Поэтому точка замера
+   * сдвигается только когда счётчик вырос, а измерение идёт по интервалу
+   * между такими сдвигами.
+   */
+  private measureStepRate(): number {
+    const executed = this.bridge.usingWorker
+      ? this.world.stepsExecuted
+      : this.world.steps;
+    const now = performance.now();
+    const previous = this.stepRateMark;
+    if (!previous) {
+      this.stepRateMark = { time: now, executed };
+      return 0;
+    }
+    if (executed === previous.executed) {
+      // Прогресса нет: держим последнюю оценку, но не дольше секунды —
+      // иначе подпись показывала бы скорость уже остановившейся системы.
+      return now - previous.time > 1000 ? 0 : this.lastStepRate;
+    }
+    const dt = (now - previous.time) / 1000;
+    this.stepRateMark = { time: now, executed };
+    if (dt <= 0) return this.lastStepRate;
+    this.lastStepRate = Math.max(0, (executed - previous.executed) / dt);
+    return this.lastStepRate;
   }
 
   private updateHud(): void {
@@ -1177,10 +1422,33 @@ export class App {
     return '  ·  равновесие';
   }
 
+  /**
+   * Привести элементы управления к текущему состоянию мира.
+   *
+   * ─── Почему здесь нужны «заказанные» значения ────────────────────────────
+   *
+   * В режиме воркера `this.world` — это ЗЕРКАЛО последнего полученного кадра.
+   * Сразу после команды оно ещё показывает прежнее состояние: воркер не успел
+   * прислать новый кадр. Если синхронизировать ползунки по зеркалу в этот
+   * момент, они откатываются на старое значение — именно так «не
+   * настраивалось» число частиц: ползунок возвращался на 2048, хотя система
+   * пересобиралась на 4000.
+   *
+   * Поэтому у ползунков числа частиц и плотности есть «заказанное» значение:
+   * пока зеркало не догнало, показывается оно.
+   */
   private syncControls(): void {
     this.bindings.temperature?.set(this.world.params.temperature);
-    this.bindings.density?.set(this.world.params.density);
-    this.bindings.count?.set(this.world.state.count);
+    // Число частиц: у ГЦК оно округляется до 4n³, поэтому сверяемся с миром,
+    // как только он подтвердил заказ.
+    if (this.desiredCount !== null && this.world.state.count === this.desiredCount) {
+      this.desiredCount = null;
+    }
+    this.bindings.count?.set(this.desiredCount ?? this.world.state.count);
+    if (this.desiredDensity !== null && Math.abs(this.world.params.density - this.desiredDensity) < 1e-9) {
+      this.desiredDensity = null;
+    }
+    this.bindings.density?.set(this.desiredDensity ?? this.world.params.density);
     this.bindings.thermostat?.set(this.world.params.thermostat);
     this.bindings.boundary?.set(this.world.params.boundary);
   }
@@ -1484,6 +1752,17 @@ export class App {
         drawMs: this.drawMs,
         stepsPerFrame: this.state.stepsPerFrame,
         bondsDrawn: this.renderer.bondStatsSnapshot.drawn,
+        /**
+         * Очередь заказанных, но ещё не выполненных шагов.
+         *
+         * Это главный диагностический признак для режима воркера: растущая
+         * очередь означает, что главный поток заказывает быстрее, чем воркер
+         * считает. Именно так выглядела регрессия с неработающей паузой, и
+         * без этого числа её нельзя было бы заметить до жалобы игрока.
+         */
+        workerBacklog: this.bridge.backlog,
+        /** Стоимость шага, измеренная воркером (мс); 0 вне режима воркера. */
+        stepCostMs: this.bridge.stepCostMs,
       }),
       /**
        * Замер отрисовки в отрыве от физики: N отрисовок подряд.
@@ -1504,6 +1783,46 @@ export class App {
         return { msPerFrame: total / Math.max(1, frames), particles, bonds };
       },
       workerSelfTest: (steps?: number) => PhysicsBridge.selfTest(steps),
+      /**
+       * Диагностика физики: где считается и что происходит с очередью.
+       *
+       * Нужна инструментам проверки (`smoke`, `showcase`, профилировщику).
+       * Считать это «отладочным мусором» нельзя: регрессия с неработающей
+       * паузой была видна РОВНО здесь — как растущая очередь заказанных
+       * шагов, — а `metrics()` её не показывал вовсе. Без этого числа дефект
+       * снова прошёл бы незамеченным до жалобы игрока.
+       */
+      workerDiagnostics: () => {
+        const status = this.bridge.status();
+        return {
+          mode: status.mode,
+          workerReady: status.ready,
+          framesReceived: status.framesReceived,
+          error: status.error,
+          /** Очередь заказанных, но не выполненных шагов. */
+          backlog: this.bridge.backlog,
+          /** Стоимость шага по замеру воркера (мс). */
+          stepCostMs: this.bridge.stepCostMs,
+          /** Монотонный счётчик выполненных шагов. */
+          stepsExecuted: this.world.stepsExecuted,
+          /** Число шагов на кадр, выбранное автоподстройкой. */
+          stepsPerFrame: this.state.stepsPerFrame,
+          paused: this.paused,
+          /*
+           * Статистика МИРА ДЛЯ ЧТЕНИЯ (в режиме воркера — зеркала).
+           *
+           * Именно эти числа рисуются на графиках, и в режиме воркера их
+           * источник другой, чем локальный мир (`api().world` — это ЛОКАЛЬНЫЙ
+           * мир, он стоит на месте). Без этих полей проверить, что графики
+           * наполняются, было нельзя: замер по локальному миру показывал
+           * нули и выглядел как «графики не работают».
+           */
+          historyPoints: this.world.history.size,
+          radialSamples: this.world.radial.sampleCount,
+          structureSamples: this.world.structure.sampleCount,
+          msdOrigins: this.world.msd.originCount,
+        };
+      },
       /**
        * Вернуть физику в главный поток.
        *
@@ -1622,7 +1941,16 @@ export interface PhysLabApi {
   };
   boxLength(count: number, density: number): number;
   /** Разбивка времени кадра: физика, отрисовка, число шагов. */
-  timings(): { physicsMs: number; drawMs: number; stepsPerFrame: number; bondsDrawn: number };
+  timings(): {
+    physicsMs: number;
+    drawMs: number;
+    stepsPerFrame: number;
+    bondsDrawn: number;
+    /** Очередь заказанных, но не выполненных шагов (режим воркера). */
+    workerBacklog: number;
+    /** Стоимость шага по замеру воркера, мс (0 вне режима воркера). */
+    stepCostMs: number;
+  };
   /** Замер только отрисовки, без шагов физики. */
   measureDraw(frames: number): { msPerFrame: number; particles: number; bonds: number };
   /**
@@ -1634,6 +1962,26 @@ export interface PhysLabApi {
    * кадрами работает в реальной среде.
    */
   workerSelfTest(steps?: number): Promise<{ ok: boolean; error?: string; summary?: unknown }>;
+  /** Диагностика физики: режим, очередь заказанных шагов, стоимость шага. */
+  workerDiagnostics(): {
+    mode: 'worker' | 'local';
+    workerReady: boolean;
+    framesReceived: number;
+    error: string | null;
+    backlog: number;
+    stepCostMs: number;
+    stepsExecuted: number;
+    stepsPerFrame: number;
+    paused: boolean;
+    /** Точки истории на графиках T и E — из мира ДЛЯ ЧТЕНИЯ. */
+    historyPoints: number;
+    /** Кадры статистики g(r). */
+    radialSamples: number;
+    /** Кадры статистики S(k). */
+    structureSamples: number;
+    /** Число начал отсчёта MSD. */
+    msdOrigins: number;
+  };
   /**
    * Вернуть физику в главный поток — для инструментов проверки.
    *

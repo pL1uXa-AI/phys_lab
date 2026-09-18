@@ -314,6 +314,86 @@ async function main() {
       );
     }
 
+    /*
+     * ─── Поведение ПРИЛОЖЕНИЯ в режиме воркера ───────────────────────────
+     *
+     * Этот блок появился из-за регрессии, которую прежний smoke пропускал.
+     * Он проверял, что воркер ЗАПУСКАЕТСЯ, и сразу уходил в локальный режим —
+     * то есть всё поведение самого приложения (пауза, ползунки, сбросы,
+     * производительность) в режиме воркера оставалось непроверенным.
+     * Пользователь при этом видел ровно обратное: неработающую паузу,
+     * ненастраиваемое число частиц и падение частоты кадров.
+     *
+     * Здесь проверяются три признака, каждый из которых соответствовал
+     * отдельной жалобе.
+     */
+    const workerBehaviour = await client.evaluate(`
+      (async () => {
+        const app = window.__physLab;
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        // 1. Очередь заказанных шагов. Растущая очередь означала, что
+        //    главный поток заказывает быстрее, чем воркер считает: именно
+        //    поэтому «Пауза» не останавливала движение.
+        await sleep(4000);
+        const backlogs = [];
+        for (let i = 0; i < 4; i++) {
+          backlogs.push(app.workerDiagnostics().backlog);
+          await sleep(500);
+        }
+
+        // 2. Число шагов на кадр. Оно обязано держаться в пределах,
+        //    измеренных профилировщиком: выше 16 воркер считает медленнее.
+        const stepsPerFrame = app.workerDiagnostics().stepsPerFrame;
+
+        // 3. Пауза: счётчик монотонных шагов не должен расти.
+        document.querySelector('[data-action="run"]').click();
+        await sleep(500);
+        const before = app.workerDiagnostics();
+        await sleep(2000);
+        const after = app.workerDiagnostics();
+        document.querySelector('[data-action="run"]').click();
+
+        return {
+          backlogs,
+          maxBacklog: Math.max(...backlogs),
+          stepsPerFrame,
+          pausedGrowth: after.stepsExecuted - before.stepsExecuted,
+          framesReceived: after.framesReceived,
+          stepCostMs: after.stepCostMs,
+          // 4. Графики: их данные в режиме воркера приходят ЗЕРКАЛОМ, а не из
+          //    локального мира. Проверять их по api().world бессмысленно —
+          //    локальный мир стоит на месте, и нули там ничего не значат.
+          historyPoints: after.historyPoints,
+          radialSamples: after.radialSamples,
+          structureSamples: after.structureSamples,
+        };
+      })()
+    `, 120000);
+
+    check(
+      'очередь заказанных шагов не растёт безгранично',
+      workerBehaviour.maxBacklog < 200,
+      `отставание по замерам: ${workerBehaviour.backlogs.join(', ')} шагов`,
+    );
+    check(
+      'число шагов на кадр в измеренной рабочей зоне воркера',
+      workerBehaviour.stepsPerFrame >= 1 && workerBehaviour.stepsPerFrame <= 16,
+      `шагов на кадр ${workerBehaviour.stepsPerFrame}, стоимость шага ${workerBehaviour.stepCostMs.toFixed(2)} мс`,
+    );
+    check(
+      'графики наполняются в режиме воркера',
+      workerBehaviour.historyPoints > 100 &&
+        workerBehaviour.radialSamples > 0 &&
+        workerBehaviour.structureSamples > 0,
+      `история ${workerBehaviour.historyPoints} точек, g(r) ${workerBehaviour.radialSamples}, S(k) ${workerBehaviour.structureSamples}`,
+    );
+    check(
+      'пауза останавливает физику и в режиме воркера',
+      workerBehaviour.pausedGrowth === 0,
+      `прирост за 2 с паузы: ${workerBehaviour.pausedGrowth} шагов`,
+    );
+
     // Переходим в локальный режим для остальных проверок.
     await client.evaluate('window.__physLab.useLocalPhysics()');
     const localMode = await client.evaluate('window.__physLab.physicsMode()');

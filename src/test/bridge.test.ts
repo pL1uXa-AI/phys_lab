@@ -85,6 +85,24 @@ function workerBridge(): { bridge: PhysicsBridge; port: FakePort; local: World }
   return { bridge, port, local };
 }
 
+/**
+ * Подтвердить воркеру, что он выполнил заказанные шаги.
+ *
+ * Мост держит очередь заказов и не шлёт новые, пока воркер не подтвердил
+ * предыдущие кадром. В тестах воркер отвечает только `ready`, поэтому очередь
+ * нужно «разгружать» вручную — иначе обратное давление (намеренно) заблокирует
+ * все последующие заказы.
+ */
+function confirmSteps(bridge: PhysicsBridge, port: FakePort, executed: number): void {
+  const world = makeWorld();
+  const frame = localFrame(world);
+  port.reply({
+    type: 'frame',
+    payload: { ...frame, summary: { ...frame.summary, stepsExecuted: executed } },
+  });
+  bridge.sync();
+}
+
 describe('мост физики: режимы', () => {
   it('по умолчанию работает на локальном мире', () => {
     const { bridge, world } = localBridge();
@@ -139,6 +157,10 @@ describe('мост физики: маршрутизация команд', () =>
     // Если бы шаги считались ещё и локально, физика пошла бы в двух местах
     // сразу — это и есть «частицы дрожат».
     const { bridge, port, local } = workerBridge();
+    // Воркер при создании получил заказ «догнать» локальный мир. Пока он его
+    // не подтвердил, кадров нет, и обратное давление обязано придержать
+    // новые заказы — иначе очередь росла бы.
+    confirmSteps(bridge, port, local.steps);
     const before = local.steps;
     bridge.advance(12);
     const run = port.ofType('run').pop() as unknown as { steps: number };
@@ -224,6 +246,70 @@ describe('мост физики: маршрутизация команд', () =>
     expect(poke.type).toBe('poke');
     expect(poke.center.x).toBe(2);
     expect(poke.radius).toBe(3);
+  });
+
+  /*
+   * ─── Обратное давление очереди ──────────────────────────────────────────
+   *
+   * Группа проверок на регрессию, из-за которой «не работала пауза».
+   *
+   * Главный поток заказывал шаги каждый кадр отрисовки, не глядя, успевает ли
+   * воркер. На замерах очередь доходила до 2100 шагов, и после нажатия
+   * «Пауза» воркер продолжал шагать ещё около 950 шагов — со стороны это
+   * выглядело как «кнопка не работает». Причина была именно в отсутствии
+   * обратной связи, а не в самой кнопке.
+   */
+  it('пока воркер не подтвердил шаги, новые порции не заказываются', () => {
+    const { bridge, port } = workerBridge();
+    // Мир воркера создан, но кадра с подтверждением ещё не было: в очереди
+    // висит начальный заказ, и новый заказ обязан быть придержан.
+    const before = port.ofType('run').length;
+    bridge.advance(8);
+    expect(port.ofType('run').length).toBe(before);
+    expect(bridge.backlog).toBeGreaterThan(0);
+  });
+
+  it('после подтверждения кадром очередь снова пропускает заказы', () => {
+    const { bridge, port, local } = workerBridge();
+    confirmSteps(bridge, port, local.steps);
+    expect(bridge.backlog).toBe(0);
+    const before = port.ofType('run').length;
+    bridge.advance(8);
+    expect(port.ofType('run').length).toBe(before + 1);
+  });
+
+  it('одиночный «Шаг» выполняется даже при занятой очереди', () => {
+    /*
+     * Покадровый заказ обязан уважать обратное давление, но дискретное
+     * действие игрока — нет: молча проглотить нажатие «Шаг» значит показать
+     * игроку неработающую кнопку. Это ровно тот класс дефектов, который и
+     * привёл к жалобе на «Пуск/Пауза».
+     */
+    const { bridge, port } = workerBridge();
+    const before = port.ofType('run').length;
+    bridge.advance(1, true);
+    expect(port.ofType('run').length).toBe(before + 1);
+  });
+
+  it('смена числа частиц согласует учёт очереди, а не залипает', () => {
+    // Пересборка заменяет мир, поэтому «долг» надо пересчитать от того, что
+    // воркер уже подтвердил. Иначе очередь либо залипнет навсегда, либо
+    // обратное давление перестанет работать.
+    const { bridge, port, local } = workerBridge();
+    confirmSteps(bridge, port, local.steps);
+    bridge.resize(512, 0.8, 'fcc');
+    expect(bridge.backlog).toBe(0);
+    const before = port.ofType('run').length;
+    bridge.advance(6);
+    expect(port.ofType('run').length).toBe(before + 1);
+  });
+
+  it('счётчик выполненного доходит из кадра и не путается со steps', () => {
+    const { bridge, port, local } = workerBridge();
+    confirmSteps(bridge, port, local.steps + 500);
+    expect(bridge.world.stepsExecuted).toBe(local.steps + 500);
+    // `steps` — про текущую траекторию, он сбрасывается пересборкой.
+    expect(bridge.world.steps).toBe(local.steps);
   });
 
   it('снимок в локальном режиме доступен сразу', async () => {

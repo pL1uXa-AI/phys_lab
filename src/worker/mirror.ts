@@ -153,6 +153,10 @@ export class WorldMirror {
   readonly volume: number;
   readonly msdReady: boolean;
   readonly msdProgress: number;
+  /** Сколько шагов воркер выполнил — монотонно, не сбрасывается пересборкой. */
+  readonly stepsExecuted: number;
+  /** Измеренная воркером стоимость одного шага, мс. */
+  readonly stepCostMs: number;
 
   private readonly frame: FramePayload;
   private readonly bondView: MirrorBonds;
@@ -172,6 +176,8 @@ export class WorldMirror {
     this.volume = s.box * s.box * s.box;
     this.msdReady = s.msdReady;
     this.msdProgress = s.msdProgress;
+    this.stepsExecuted = s.stepsExecuted;
+    this.stepCostMs = s.stepCostMs;
     this.frozen = frame.frozen;
     this.bondView = bondsOfFrame(frame);
 

@@ -65,6 +65,27 @@ export class PhysicsBridge {
   private error: string | null = null;
   /** Последний полученный кадр — из него строится зеркало. */
   private mirror: WorldMirror | null = null;
+  /**
+   * Сколько шагов главный поток ЗАКАЗАЛ у воркера.
+   *
+   * Вместе с `executedSteps` даёт «долг» — число заказанных, но ещё не
+   * выполненных шагов. Именно из-за отсутствия этого учёта возникала
+   * регрессия: главный поток заказывал новую порцию каждый кадр отрисовки,
+   * не глядя, успевает ли воркер. На 2048 частицах воркер считал ~200 шагов
+   * в секунду, а заказывалось ~1200 — очередь росла, шаги продолжались после
+   * нажатия «Пауза», и интерфейс показывал состояние всё более отстающее.
+   */
+  private orderedSteps = 0;
+  /** Сколько шагов воркер подтвердил последним кадром. */
+  private executedSteps = 0;
+  /**
+   * Всего заказано шагов за время работы — монотонно.
+   *
+   * Нужен автоподстройке: она сравнивает прирост заказов с приростом
+   * выполненных шагов и по разнице понимает, успевает ли воркер. Обычный
+   * `orderedSteps` для этого не годится — он привязан к текущей очереди.
+   */
+  private orderedTotalSteps = 0;
 
   constructor(initial: World) {
     this.local = initial;
@@ -194,7 +215,14 @@ export class PhysicsBridge {
       20260214,
       'fcc',
     );
-    this.client.run(this.local.steps);
+    /*
+     * Мир в воркере создан заново, поэтому его счётчик выполненного — с нуля.
+     * Начальный «долг» равен только что заказанным шагам, и никаких других
+     * заказов в полёте нет.
+     */
+    this.executedSteps = 0;
+    this.orderedSteps = 0;
+    this.orderSteps(this.local.steps);
     return true;
   }
 
@@ -218,6 +246,7 @@ export class PhysicsBridge {
     if (this.mode !== 'worker') return false;
     const frame = this.client.consume();
     if (!frame) return false;
+    this.executedSteps = frame.summary.stepsExecuted;
     // Зеркало пересоздаётся на каждый кадр: буферы предыдущего уже отданы
     // воркеру обратно, и читать из них нельзя.
     this.mirror = new WorldMirror(frame);
@@ -226,15 +255,73 @@ export class PhysicsBridge {
   }
 
   /**
+   * Сколько заказанных шагов воркер ещё не выполнил.
+   *
+   * Это «долг» в шагах. Ноль означает, что воркер догнал заказы и следующий
+   * заказ будет выполнен сразу.
+   */
+  get backlog(): number {
+    if (this.mode !== 'worker') return 0;
+    return Math.max(0, this.orderedSteps - this.executedSteps);
+  }
+
+  /**
+   * Стоимость одного шага, измеренная воркером (мс).
+   *
+   * Возвращает 0, пока воркер не прислал ни одного кадра с замером: тогда
+   * автоподстройка обязана воздержаться от выводов, а не считать по нулю.
+   */
+  get stepCostMs(): number {
+    return this.mirror?.stepCostMs ?? 0;
+  }
+
+  /**
    * Выполнить шаги физики.
    *
    * В режиме воркера шаги только ЗАКАЗЫВАЮТСЯ: результат придёт следующим
    * кадром. Это принципиально — ждать его синхронно значило бы потерять весь
    * смысл воркера.
+   *
+   * ─── Обратное давление ──────────────────────────────────────────────────
+   *
+   * Новая порция заказывается, только если воркер уже разобрал предыдущую.
+   * Без этого правила главный поток (60 кадров в секунду) заказывал бы шаги
+   * быстрее, чем воркер успевает считать, и получалась бы растущая очередь:
+   *   * «Пауза» не останавливала движение — в очереди ждали сотни шагов;
+   *   * на экране было состояние всё более далёкого прошлого;
+   *   * автоподстройка, видя «дешёвый» заказ, ещё увеличивала порцию.
+   * Измерено до исправления: в очереди накапливалось 2100+ шагов, а после
+   * нажатия «Пауза» воркер продолжал шагать ещё около 950 шагов.
+   *
+   * Теперь в полёте не больше одной порции: темп физики задаёт воркер, а не
+   * частота кадров отрисовки. Отрисовка при этом продолжает идти на 60 к/с —
+   * пропускается только ЗАКАЗ, и картинка остаётся плавной.
    */
-  advance(steps: number): void {
+  advance(steps: number, force = false): void {
     if (this.mode === 'worker') {
-      if (this.ready) this.client.run(steps);
+      if (!this.ready) return;
+      const batch = Math.max(1, Math.round(steps));
+      /*
+       * `force` — для дискретного действия игрока («Шаг»).
+       *
+       * Покадровый заказ обязан уважать обратное давление, иначе очередь
+       * растёт. Но одиночный шаг, нажатый человеком, обязан выполниться
+       * всегда: молча проглотить нажатие — это ровно тот класс дефектов,
+       * из-за которого интерфейс кажется сломанным.
+       */
+      /*
+       * В полёте держим не больше ДВУХ порций.
+       *
+       * Одной мало: пока воркер считает порцию и отправляет кадр, он мог бы
+       * простаивать. Больше двух — это уже растущая очередь, из-за которой
+       * «Пауза» вступала в силу с задержкой в сотни шагов.
+       *
+       * Условие строгое (`>=`): при `backlog > batch` и единственной
+       * заказанной порции заказ всё равно проходил, и очередь росла на порцию
+       * за каждый кадр отрисовки — исходная регрессия возвращалась.
+       */
+      if (!force && this.backlog >= batch * 2) return;
+      this.orderSteps(batch);
       return;
     }
     for (let i = 0; i < steps; i++) this.local.step();
@@ -303,6 +390,27 @@ export class PhysicsBridge {
   }
 
   /**
+   * Заказать у воркера порцию шагов, учитывая её в «долге».
+   *
+   * Единая точка для ВСЕХ заказов шагов: если где-то отправить `run` напрямую,
+   * учёт разойдётся, и обратное давление либо залипнет (долг никогда не
+   * обнулится), либо перестанет ограничивать очередь. Ровно так и возникала
+   * регрессия с неработающей паузой.
+   */
+  private orderSteps(steps: number): void {
+    if (!Number.isFinite(steps) || steps <= 0) return;
+    const batch = Math.max(1, Math.round(steps));
+    this.orderedSteps += batch;
+    this.orderedTotalSteps += batch;
+    this.client.run(batch);
+  }
+
+  /** Сколько шагов заказано за всё время — монотонно. */
+  get orderedTotal(): number {
+    return this.orderedTotalSteps;
+  }
+
+  /**
    * Применить НАБОР параметров и пересобрать систему.
    *
    * Одним вызовом, а не девятью командами: пресет задаёт все параметры сразу,
@@ -319,7 +427,12 @@ export class PhysicsBridge {
     if (this.mode === 'worker') {
       this.client.send({ type: 'configure', patch: params });
       this.client.send({ type: 'resize', count, density, lattice });
-      if (equilibrate > 0) this.client.send({ type: 'run', steps: equilibrate });
+      this.resetQueueAccounting();
+      if (equilibrate > 0) {
+        // Отжиг — это тоже шаги, и они обязаны попасть в учёт: иначе
+        // обратное давление не увидит, что воркер занят, и закажет ещё.
+        this.orderSteps(equilibrate);
+      }
       return;
     }
     this.local.params = { ...this.local.params, ...params };
@@ -327,10 +440,33 @@ export class PhysicsBridge {
     if (equilibrate > 0) this.local.run(equilibrate);
   }
 
+  /**
+   * Согласовать счётчики очереди с пересозданным миром.
+   *
+   * ─── Почему здесь НЕ надо ничего сбрасывать ──────────────────────────────
+   *
+   * `stepsExecuted` воркера монотонный: пересборка мира его не обнуляет.
+   * `orderedSteps` считает КАЖДЫЙ заказ, прошедший через `orderSteps`, тоже
+   * монотонно. Значит их разность сама по себе корректна и после пересборки:
+   * и заказ отжига, и заказ шагов игрока попадают в учёт одинаково.
+   *
+   * Первая версия всё же сбрасывала `orderedSteps` в последнее подтверждённое
+   * значение — и это оказалось дефектом. Сброс «съедал» заказы, которые уже
+   * ушли воркеру, но ещё не подтверждены кадром: разность уходила в минус
+   * (измерено −742 шага), обратное давление переставало ограничивать очередь,
+   * и регрессия возвращалась.
+   *
+   * Метод оставлен как явная точка, где это решение зафиксировано.
+   */
+  private resetQueueAccounting(): void {
+    // Намеренно пусто: см. объяснение выше.
+  }
+
   /** Пересборка под новое число частиц. */
   resize(count: number, density: number, lattice: LatticeKind): void {
     if (this.mode === 'worker') {
       this.client.send({ type: 'resize', count, density, lattice });
+      this.resetQueueAccounting();
       return;
     }
     this.local.resize(count, density, lattice);
@@ -340,6 +476,7 @@ export class PhysicsBridge {
   requestRebuild(lattice: LatticeKind, keepTemperature: boolean): void {
     if (this.mode === 'worker') {
       this.client.send({ type: 'rebuild', lattice, keepTemperature });
+      this.resetQueueAccounting();
       return;
     }
     this.local.requestRebuild(lattice, keepTemperature);
@@ -349,6 +486,7 @@ export class PhysicsBridge {
   rebuild(lattice: LatticeKind, keepTemperature: boolean): void {
     if (this.mode === 'worker') {
       this.client.send({ type: 'rebuild', lattice, keepTemperature });
+      this.resetQueueAccounting();
       return;
     }
     this.local.rebuild(lattice, keepTemperature);
@@ -455,6 +593,9 @@ export class PhysicsBridge {
   restoreJson(json: string): string | null {
     if (this.mode === 'worker') {
       this.client.send({ type: 'restore', json });
+      // Снимок заменяет мир целиком: счётчики очереди надо согласовать,
+      // иначе «долг» посчитается по прежнему миру.
+      this.resetQueueAccounting();
       return null;
     }
     const parsed = parseSnapshot(json);
@@ -480,6 +621,8 @@ export class PhysicsBridge {
      */
     this.current = this.local;
     this.mirror = null;
+    this.orderedSteps = 0;
+    this.executedSteps = 0;
     this.client.stop();
     this.mode = 'local';
     this.ready = false;
