@@ -427,7 +427,6 @@ export class PhysicsBridge {
     if (this.mode === 'worker') {
       this.client.send({ type: 'configure', patch: params });
       this.client.send({ type: 'resize', count, density, lattice });
-      this.resetQueueAccounting();
       if (equilibrate > 0) {
         // Отжиг — это тоже шаги, и они обязаны попасть в учёт: иначе
         // обратное давление не увидит, что воркер занят, и закажет ещё.
@@ -440,33 +439,25 @@ export class PhysicsBridge {
     if (equilibrate > 0) this.local.run(equilibrate);
   }
 
-  /**
-   * Согласовать счётчики очереди с пересозданным миром.
+  /*
+   * ─── Почему пересборка НЕ трогает учёт очереди ───────────────────────────
    *
-   * ─── Почему здесь НЕ надо ничего сбрасывать ──────────────────────────────
+   * Ни `resize`, ни `rebuild`, ни `restore` не сбрасывают `orderedSteps` и
+   * `executedSteps`. Оба счётчика монотонные, и их разность остаётся верной
+   * после смены мира: и заказ отжига, и заказ шагов игрока проходят через
+   * один `orderSteps`, а `stepsExecuted` воркера пересборка не обнуляет.
    *
-   * `stepsExecuted` воркера монотонный: пересборка мира его не обнуляет.
-   * `orderedSteps` считает КАЖДЫЙ заказ, прошедший через `orderSteps`, тоже
-   * монотонно. Значит их разность сама по себе корректна и после пересборки:
-   * и заказ отжига, и заказ шагов игрока попадают в учёт одинаково.
-   *
-   * Первая версия всё же сбрасывала `orderedSteps` в последнее подтверждённое
-   * значение — и это оказалось дефектом. Сброс «съедал» заказы, которые уже
-   * ушли воркеру, но ещё не подтверждены кадром: разность уходила в минус
-   * (измерено −742 шага), обратное давление переставало ограничивать очередь,
-   * и регрессия возвращалась.
-   *
-   * Метод оставлен как явная точка, где это решение зафиксировано.
+   * Здесь была ошибка. Первая версия «согласовывала» счётчики, приравнивая
+   * `orderedSteps` к последнему подтверждённому значению. Это съедало заказы,
+   * которые уже ушли воркеру, но ещё не подтверждены кадром: разность уходила
+   * в минус (измерено −742 шага), обратное давление переставало ограничивать
+   * очередь, и регрессия с неработающей паузой возвращалась.
    */
-  private resetQueueAccounting(): void {
-    // Намеренно пусто: см. объяснение выше.
-  }
 
   /** Пересборка под новое число частиц. */
   resize(count: number, density: number, lattice: LatticeKind): void {
     if (this.mode === 'worker') {
       this.client.send({ type: 'resize', count, density, lattice });
-      this.resetQueueAccounting();
       return;
     }
     this.local.resize(count, density, lattice);
@@ -476,7 +467,6 @@ export class PhysicsBridge {
   requestRebuild(lattice: LatticeKind, keepTemperature: boolean): void {
     if (this.mode === 'worker') {
       this.client.send({ type: 'rebuild', lattice, keepTemperature });
-      this.resetQueueAccounting();
       return;
     }
     this.local.requestRebuild(lattice, keepTemperature);
@@ -486,7 +476,6 @@ export class PhysicsBridge {
   rebuild(lattice: LatticeKind, keepTemperature: boolean): void {
     if (this.mode === 'worker') {
       this.client.send({ type: 'rebuild', lattice, keepTemperature });
-      this.resetQueueAccounting();
       return;
     }
     this.local.rebuild(lattice, keepTemperature);
@@ -593,9 +582,6 @@ export class PhysicsBridge {
   restoreJson(json: string): string | null {
     if (this.mode === 'worker') {
       this.client.send({ type: 'restore', json });
-      // Снимок заменяет мир целиком: счётчики очереди надо согласовать,
-      // иначе «долг» посчитается по прежнему миру.
-      this.resetQueueAccounting();
       return null;
     }
     const parsed = parseSnapshot(json);
