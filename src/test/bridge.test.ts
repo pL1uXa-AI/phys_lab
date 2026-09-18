@@ -456,6 +456,24 @@ describe('зеркало: чтение совпадает с настоящим 
     expect(last?.mobileFraction).toBeGreaterThan(0);
   });
 
+  it('зеркало не обнуляет число начал отсчёта MSD', () => {
+    /*
+     * Тот же класс дефекта, что и потерянные столбцы истории: зеркало
+     * возвращало ноль с обоснованием «величина ничего не решает». Отличить
+     * «начал нет» от «данные не передали» по такому числу невозможно, а
+     * `metrics().msdOrigins` показывал ноль даже при набранной статистике.
+     */
+    const world = makeWorld();
+    for (let i = 0; i < 8; i++) {
+      world.run(20);
+      world.sampleRadial();
+    }
+    expect(world.msd.originCount).toBeGreaterThan(0);
+    const mirror = new WorldMirror(localFrame(world));
+    expect(mirror.msd.originCount).toBe(world.msd.originCount);
+    expect(mirror.msd.originCount).toBeGreaterThan(0);
+  });
+
   it('история отдаёт нужные ряды и не врёт про размер', () => {
     const world = makeWorld();
     world.run(200);

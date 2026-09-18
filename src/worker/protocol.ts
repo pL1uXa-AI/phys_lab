@@ -223,6 +223,15 @@ export interface FrameSummary {
   /** Готово ли окно MSD. */
   msdReady: boolean;
   msdProgress: number;
+  /**
+   * Сколько начал отсчёта MSD сейчас живо.
+   *
+   * Передаётся отдельно, хотя «ничего не решает в поведении»: это
+   * диагностическая величина, и зеркало, отдававшее вместо неё ноль, врало
+   * ровно так же, как врало с тремя столбцами истории (см. `FrameCurves`).
+   * Стоимость — одно число на кадр.
+   */
+  msdOriginCount: number;
   /** Число кадров статистики и пик S(k). */
   radialSamples: number;
   structureSamples: number;

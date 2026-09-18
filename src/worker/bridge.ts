@@ -78,14 +78,6 @@ export class PhysicsBridge {
   private orderedSteps = 0;
   /** Сколько шагов воркер подтвердил последним кадром. */
   private executedSteps = 0;
-  /**
-   * Всего заказано шагов за время работы — монотонно.
-   *
-   * Нужен автоподстройке: она сравнивает прирост заказов с приростом
-   * выполненных шагов и по разнице понимает, успевает ли воркер. Обычный
-   * `orderedSteps` для этого не годится — он привязан к текущей очереди.
-   */
-  private orderedTotalSteps = 0;
 
   constructor(initial: World) {
     this.local = initial;
@@ -401,13 +393,7 @@ export class PhysicsBridge {
     if (!Number.isFinite(steps) || steps <= 0) return;
     const batch = Math.max(1, Math.round(steps));
     this.orderedSteps += batch;
-    this.orderedTotalSteps += batch;
     this.client.run(batch);
-  }
-
-  /** Сколько шагов заказано за всё время — монотонно. */
-  get orderedTotal(): number {
-    return this.orderedTotalSteps;
   }
 
   /**

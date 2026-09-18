@@ -393,6 +393,7 @@ export function localFrame(world: World): FramePayload {
       diffusionR2: world.diffusion().r2,
       msdReady: world.msdReady,
       msdProgress: world.msdProgress,
+      msdOriginCount: world.msd.originCount,
       radialSamples: world.radial.sampleCount,
       structureSamples: world.structure.sampleCount,
       structurePeak: peak.height,

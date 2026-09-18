@@ -243,6 +243,7 @@ function makeFrame(w: World): FramePayload {
     diffusionR2: w.diffusion().r2,
     msdReady: w.msdReady,
     msdProgress: w.msdProgress,
+    msdOriginCount: w.msd.originCount,
     radialSamples: w.radial.sampleCount,
     structureSamples: w.structure.sampleCount,
     structurePeak: structurePeak.height,
