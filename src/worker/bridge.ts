@@ -32,7 +32,7 @@ import { parseSnapshot, serializeSnapshot } from '../core/snapshot.js';
 import type { LatticeKind, WorldParams } from '../core/types.js';
 import { PhysicsWorkerClient } from './client.js';
 import { WorldMirror } from './mirror.js';
-import type { FramePayload } from './protocol.js';
+import type { FramePayload, FrameSummary } from './protocol.js';
 
 /** Где считаются силы. */
 export type PhysicsMode = 'worker' | 'local';
@@ -116,12 +116,20 @@ export class PhysicsBridge {
    * стартует, что Vite собрал модуль воркера и что обмен кадрами работает
    * в реальной среде. Этот метод закрывает именно этот пробел.
    *
+   * @param steps сколько шагов прогнать
+   * @param create необязательный порт воркера — для тестов, где настоящий
+   *               `Worker` недоступен. Позволяет воспроизвести гонку
+   *               «начальный кадр пришёл раньше, чем выполнены шаги»
+   *               детерминированно, а не надеяться на удачный порядок
    * @returns сводка после прогона или текст ошибки
    */
-  static async selfTest(steps = 40): Promise<{ ok: boolean; error?: string; summary?: unknown }> {
+  static async selfTest(
+    steps = 40,
+    create?: () => Worker,
+  ): Promise<{ ok: boolean; error?: string; summary?: FrameSummary }> {
     const world = new World({ count: 256 }, 20260214, 'fcc');
     const bridge = new PhysicsBridge(world);
-    if (!bridge.enableWorker()) {
+    if (!bridge.enableWorker(create)) {
       return { ok: false, error: bridge.status().error ?? 'воркер не поднялся' };
     }
     // Ждём готовности мира: она приходит асинхронно.
@@ -135,16 +143,39 @@ export class PhysicsBridge {
       return { ok: false, error: 'мир воркера не сообщил о готовности за 15 с' };
     }
     bridge.advance(steps);
-    // Даём воркеру время посчитать и прислать кадр.
+    /*
+     * Ждём кадр, в котором ЗАКАЗАННЫЕ шаги уже выполнены.
+     *
+     * ─── Гонка, которая здесь была ──────────────────────────────────────────
+     *
+     * Раньше условием было «пришёл любой кадр». Но воркер отправляет кадр
+     * сразу после создания мира, до всяких `run`: этот кадр содержит ноль
+     * шагов. Если он успевал дойти до `client.lastFrame` раньше, чем
+     * обрабатывался `run`, проверка получала начальное состояние и падала с
+     * «шагов 0» — при полностью исправном воркере.
+     *
+     * Гонка проявлялась не всегда: она зависит от того, успел ли первый кадр
+     * дойти до вызова `sync()`. Именно так это и выглядело в smoke:
+     * «воркер вернул осмысленную сводку — T* = 0.900, шагов 0».
+     *
+     * Поэтому условие — не «кадр есть», а «шаги сделаны»: именно это
+     * проверка и собирается подтвердить.
+     */
     const frameDeadline = Date.now() + 15000;
     let frame: FramePayload | null = null;
-    while (!frame && Date.now() < frameDeadline) {
+    while (Date.now() < frameDeadline) {
       await new Promise((resolve) => setTimeout(resolve, 50));
       bridge.sync();
-      frame = bridge.client.lastFrame;
+      const candidate = bridge.client.lastFrame;
+      if (candidate && candidate.summary.steps >= steps) {
+        frame = candidate;
+        break;
+      }
     }
     bridge.destroy();
-    if (!frame) return { ok: false, error: 'кадр от воркера не пришёл за 15 с' };
+    if (!frame) {
+      return { ok: false, error: `кадр с выполненными ${steps} шагами не пришёл за 15 с` };
+    }
     /*
      * Возвращается СВОДКА кадра, а не `measurement`: в сводке есть время и
      * число шагов, по которым проверка убеждается, что воркер действительно

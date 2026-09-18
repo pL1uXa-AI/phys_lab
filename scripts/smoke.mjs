@@ -346,9 +346,25 @@ async function main() {
         //    измеренных профилировщиком: выше 16 воркер считает медленнее.
         const stepsPerFrame = app.workerDiagnostics().stepsPerFrame;
 
-        // 3. Пауза: счётчик монотонных шагов не должен расти.
+        /*
+         * 3. Пауза: после того как очередь разобрана, шаги прекращаются.
+         *
+         * Важно, ЧТО здесь проверяется. Пауза останавливает ЗАКАЗЫ шагов, но
+         * до двух порций уже заказанных остаются «в полёте» — воркер обязан
+         * их досчитать, иначе потерял бы работу. Поэтому сначала ждём, пока
+         * очередь опустеет, и только потом убеждаемся, что счётчик монотонных
+         * шагов перестал расти.
+         *
+         * Первая версия проверки мерила рост сразу после клика и падала на
+         * «31 шаг за 2 с» — это был ровно остаток порции, а не продолжающийся
+         * расчёт. Проверка была права по духу и неточна по существу.
+         */
         document.querySelector('[data-action="run"]').click();
-        await sleep(500);
+        let drained = false;
+        for (let i = 0; i < 30; i++) {
+          await sleep(100);
+          if (app.workerDiagnostics().backlog === 0) { drained = true; break; }
+        }
         const before = app.workerDiagnostics();
         await sleep(2000);
         const after = app.workerDiagnostics();
@@ -358,6 +374,7 @@ async function main() {
           backlogs,
           maxBacklog: Math.max(...backlogs),
           stepsPerFrame,
+          drained,
           pausedGrowth: after.stepsExecuted - before.stepsExecuted,
           framesReceived: after.framesReceived,
           stepCostMs: after.stepCostMs,
@@ -390,8 +407,10 @@ async function main() {
     );
     check(
       'пауза останавливает физику и в режиме воркера',
-      workerBehaviour.pausedGrowth === 0,
-      `прирост за 2 с паузы: ${workerBehaviour.pausedGrowth} шагов`,
+      workerBehaviour.drained && workerBehaviour.pausedGrowth === 0,
+      workerBehaviour.drained
+        ? `прирост за 2 с паузы после разбора очереди: ${workerBehaviour.pausedGrowth} шагов`
+        : 'очередь не разобралась за 3 с — проверить не удалось',
     );
 
     // Переходим в локальный режим для остальных проверок.

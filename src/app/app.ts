@@ -44,6 +44,7 @@ import { parseSnapshot, serializeSnapshot } from '../core/snapshot.js';
 import { PhaseExperiment, type ExperimentConfig } from '../core/experiment.js';
 import { PhysicsBridge } from '../worker/bridge.js';
 import type { PhysicsView } from '../core/physics-view.js';
+import type { FrameSummary } from '../worker/protocol.js';
 import {
   canvasToPng,
   downloadDataUrl,
@@ -100,7 +101,6 @@ export class App {
   private readonly host: HTMLElement;
   private app: Application;
   private lastFrame = 0;
-  private frameCounter = 0;
   private radialCounter = 0;
   private uiCounter = 0;
   private paused = false;
@@ -1133,7 +1133,6 @@ export class App {
       // как шесть шагов, то есть замер был в разы больше правды, и число
       // шагов на кадр уезжало к единице на здоровой системе.
       this.sampleIfDue(false, steps);
-      this.frameCounter++;
     } else {
       // Шагов физики в этом кадре не было (пауза или троттлинг частоты), а
       // накопленный толчок мыши применить всё равно нужно: иначе на паузе
@@ -2009,7 +2008,7 @@ export interface PhysLabApi {
    * потому не доказывают, что Vite собрал модуль воркера и что обмен
    * кадрами работает в реальной среде.
    */
-  workerSelfTest(steps?: number): Promise<{ ok: boolean; error?: string; summary?: unknown }>;
+  workerSelfTest(steps?: number): Promise<{ ok: boolean; error?: string; summary?: FrameSummary }>;
   /** Диагностика физики: режим, очередь заказанных шагов, стоимость шага. */
   workerDiagnostics(): {
     mode: 'worker' | 'local';

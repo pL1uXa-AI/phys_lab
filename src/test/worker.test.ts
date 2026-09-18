@@ -19,6 +19,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { World } from '../core/world.js';
+import { PhysicsBridge } from '../worker/bridge.js';
 import {
   PhysicsWorkerClient,
   bondsOfFrame,
@@ -67,6 +68,49 @@ class FakePort {
   }
 }
 
+/**
+ * Порт, ведущий себя как настоящий воркер.
+ *
+ * Отвечает «ready» на `init`, сразу отправляет НАЧАЛЬНЫЙ кадр (как настоящий
+ * воркер при создании мира) и только на `run` присылает кадр с выполненными
+ * шагами. Именно такой порядок и вскрывал гонку в `selfTest`.
+ */
+class ScriptedPort {
+  onmessage: ((event: MessageEvent<WorkerEvent>) => void) | null = null;
+  onerror: ((event: ErrorEvent) => void) | null = null;
+  terminated = false;
+  private executed = 0;
+
+  postMessage(command: WorkerCommand): void {
+    if (command.type === 'init') {
+      this.reply({ type: 'ready', count: 256, box: 8 });
+      // Начальный кадр: ноль шагов. Настоящий воркер присылает его сразу.
+      this.frame(0);
+      return;
+    }
+    if (command.type === 'run') {
+      this.executed += command.steps;
+      this.frame(this.executed);
+    }
+  }
+
+  terminate(): void {
+    this.terminated = true;
+  }
+
+  private frame(steps: number): void {
+    const base = localFrame(makeSyntheticWorld());
+    this.reply({
+      type: 'frame',
+      payload: { ...base, summary: { ...base.summary, steps } },
+    });
+  }
+
+  private reply(event: WorkerEvent): void {
+    this.onmessage?.({ data: event } as MessageEvent<WorkerEvent>);
+  }
+}
+
 /** Клиент с подставным портом. */
 function makeClient(): { client: PhysicsWorkerClient; port: FakePort } {
   const client = new PhysicsWorkerClient();
@@ -86,6 +130,28 @@ function makeFrame(count = 256, seed = 20260214): { world: World; frame: FramePa
   world.run(60);
   return { world, frame: localFrame(world) };
 }
+
+describe('самопроверка воркера: не принимать начальный кадр за результат', () => {
+  it('ждёт кадр с ВЫПОЛНЕННЫМИ шагами, а не первый пришедший', async () => {
+    /*
+     * Гонка, которую поймал smoke.
+     *
+     * Воркер отправляет кадр сразу после создания мира — с нулём шагов. Если
+     * он доходил до `client.lastFrame` раньше, чем обрабатывался `run`,
+     * `selfTest` возвращал сводку начального состояния: «T = 0.900, шагов 0»,
+     * и проверка падала при полностью исправном воркере.
+     *
+     * Здесь это воспроизводится детерминированно: порт отвечает «ready» и
+     * сразу шлёт НАЧАЛЬНЫЙ кадр (0 шагов), а на команду `run` — кадр с
+     * выполненными шагами. Проверка обязана взять второй.
+     */
+    const port = new ScriptedPort();
+    const result = await PhysicsBridge.selfTest(40, () => port as unknown as Worker);
+    expect(result.ok).toBe(true);
+    // Главное: сводка не начальная. Именно это и падало в smoke.
+    expect(result.summary?.steps).toBeGreaterThanOrEqual(40);
+  });
+});
 
 describe('протокол воркера: размеры буферов', () => {
   it('ёмкость под связи растёт с числом частиц и ограничена', () => {

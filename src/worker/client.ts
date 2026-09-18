@@ -47,30 +47,13 @@ export interface WorkerStatus {
 }
 
 /**
- * Источник состояния для отрисовки.
+ * Минимум полей состояния, нужный отрисовке.
  *
- * Интерфейс намеренно повторяет те методы `World`, которые нужны рендеру и
- * панелям. Благодаря этому приложение не знает, откуда данные — из воркера
- * или из локального мира, — и переключение между режимами не разветвляет
- * код отрисовки.
+ * Раньше рядом был ещё интерфейс `PhysicsSource`, описывавший «источник
+ * состояния для отрисовки». Он оказался тупиковой ветвью: контракт чтения
+ * живёт в `core/physics-view.ts` (`PhysicsView`), и обходного пути не нужно.
+ * Два описания одного и того же — верный способ развести их со временем.
  */
-export interface PhysicsSource {
-  readonly state: MirrorState;
-  readonly frozen: Uint8Array;
-  readonly box: number;
-  readonly params: WorldParams;
-  readonly time: number;
-  readonly steps: number;
-  readonly summary: FrameSummaryLike;
-  /** Проекция точек на экран. */
-  project(yaw: number, pitch: number, out: Float32Array): void;
-  /** Значения для раскраски. */
-  colorValues(mode: string): { values: Float64Array; min: number; max: number };
-  /** Сеть связей для отрисовки. */
-  bonds(): MirrorBonds;
-}
-
-/** Минимум полей состояния, нужный отрисовке. */
 export interface MirrorState {
   count: number;
   x: Float64Array;
@@ -87,9 +70,6 @@ export interface MirrorState {
 
 /** Сеть связей в том виде, в каком её читает отрисовка. */
 export interface MirrorBonds extends ViewBonds {}
-
-/** Сводка измерений — повторяет `FrameSummary` без параметров мира. */
-export type FrameSummaryLike = Omit<FramePayload['summary'], 'params'>;
 
 /*
  * Цветовая шкала считается функцией ИЗ МИРА, а не своей копией.
@@ -329,20 +309,6 @@ export class PhysicsWorkerClient {
  */
 export function createPhysicsWorker(): Worker {
   return new Worker(new URL('./physics.worker.ts', import.meta.url), { type: 'module' });
-}
-
-/**
- * Зеркало локального мира.
- *
- * Используется, когда воркер недоступен. Возвращает ровно тот же интерфейс,
- * что и кадр воркера, поэтому приложение не разветвляется.
- */
-export class LocalPhysicsMirror {
-  constructor(private readonly world: World) {}
-
-  get frame(): FramePayload {
-    return localFrame(this.world);
-  }
 }
 
 /** Сборка кадра из локального мира — для режима без воркера. */

@@ -85,8 +85,6 @@ export interface RenderOptions {
   showTrails: boolean;
   /** Рисовать ли векторы скоростей. */
   showVectors: boolean;
-  /** Длина шлейфа в кадрах записи. */
-  trailLength: number;
 }
 
 /** Статистика слоя связей — для интерфейса и проверок. */
@@ -113,7 +111,6 @@ export class SceneRenderer {
     bondsOnTop: false,
     showTrails: true,
     showVectors: false,
-    trailLength: 60,
   };
 
   private particles!: ParticleContainer;
@@ -127,6 +124,16 @@ export class SceneRenderer {
   readonly trails = new TrailBuffer();
   /** Переиспользуемый буфер отрезков — чтобы не создавать мусор каждый кадр. */
   private readonly scratch = new SegmentBuffer(16384);
+  /**
+   * Буфер шлейфов без разрывов.
+   *
+   * Отдельное переиспользуемое поле, а не локальная переменная: раньше
+   * `filterWrapped` создавал новый `SegmentBuffer` НА КАЖДОМ кадре. При
+   * настройках по умолчанию (60 точек × 64 меченых частицы) это 60·64·6
+   * чисел, то есть около 90 КБ мусора за кадр — на 60 к/с это свыше
+   * 5 МБ/с, и сборщик мусора начинал дёргать кадры.
+   */
+  private readonly trailScratch = new SegmentBuffer(4096);
   /** Сколько частиц помечено на момент последней записи. */
   private markedFor = -1;
 
@@ -424,8 +431,8 @@ export class SceneRenderer {
     const periodic = world.params.boundary === 'periodic';
     const segments = this.trails.segments(world.box, periodic, this.scratch);
     // Разорванные периодической границей отрезки пропускаем: иначе на экране
-    // появлялись бы линии поперёк всей сцены.
-    const clean = this.filterWrapped(segments);
+    // появлялись бы линии поперёк всей сцены. Чистим в переиспользуемый буфер.
+    const clean = this.filterWrapped(segments, this.trailScratch);
     this.trailLayer.draw(clean, {
       color: TRAIL_COLOR,
       thickness: this.lineThickness(1.2),
@@ -469,9 +476,15 @@ export class SceneRenderer {
     });
   }
 
-  /** Убрать отрезки, разорванные периодической границей. */
-  private filterWrapped(buffer: SegmentBuffer): SegmentBuffer {
-    const out = new SegmentBuffer(Math.max(1, buffer.count));
+  /**
+   * Убрать отрезки, разорванные периодической границей.
+   *
+   * Пишет в переданный буфер, а не создаёт новый: результат всё равно
+   * потребляется сразу (рисуется и забывается), поэтому аллокация на кадр
+   * здесь была чистым мусором.
+   */
+  private filterWrapped(buffer: SegmentBuffer, out: SegmentBuffer): SegmentBuffer {
+    out.count = 0;
     for (let k = 0; k < buffer.count; k++) {
       if (buffer.wrapped[k] !== 0) continue;
       const base = k * 6;
