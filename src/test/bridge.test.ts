@@ -474,6 +474,28 @@ describe('зеркало: чтение совпадает с настоящим 
     expect(mirror.msd.originCount).toBeGreaterThan(0);
   });
 
+  it('зеркало передаёт участок подгонки MSD, а не весь диапазон', () => {
+    /*
+     * Зеркало возвращало в `lagRange` весь диапазон лагов. Формально график
+     * оставался верным, но подсвеченным оказывался весь график — то есть
+     * игрок видел неправду о том, где измерена прямая, по которой посчитан D.
+     */
+    const world = makeWorld();
+    for (let i = 0; i < 40; i++) {
+      world.run(20);
+      world.sampleRadial();
+    }
+    const fromWorld = world.diffusion();
+    const mirror = new WorldMirror(localFrame(world));
+    const fromMirror = mirror.diffusion();
+    expect(fromMirror.lagRange[0]).toBeCloseTo(fromWorld.lagRange[0], 6);
+    expect(fromMirror.lagRange[1]).toBeCloseTo(fromWorld.lagRange[1], 6);
+    // Участок обязан быть уже полного диапазона: иначе это снова «весь график».
+    const full = world.msdCurve().lag;
+    const fullEnd = full[full.length - 1];
+    expect(fromMirror.lagRange[1]).toBeLessThan(fullEnd);
+  });
+
   it('история отдаёт нужные ряды и не врёт про размер', () => {
     const world = makeWorld();
     world.run(200);

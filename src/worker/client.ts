@@ -391,6 +391,8 @@ export function localFrame(world: World): FramePayload {
       bondSpread: net.lengthSpread(),
       diffusion: world.diffusion().D,
       diffusionR2: world.diffusion().r2,
+      diffusionLagStart: world.diffusion().lagRange[0],
+      diffusionLagEnd: world.diffusion().lagRange[1],
       msdReady: world.msdReady,
       msdProgress: world.msdProgress,
       msdOriginCount: world.msd.originCount,

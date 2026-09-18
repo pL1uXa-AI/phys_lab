@@ -222,6 +222,7 @@ function makeFrame(w: World): FramePayload {
 
   const measurement = w.measurement;
   const structurePeak = w.structure.firstPeak();
+  const diffusionResult = w.diffusion();
   const summary: FrameSummary = {
     count,
     box: w.box,
@@ -239,8 +240,10 @@ function makeFrame(w: World): FramePayload {
     orderPeak: w.orderPeak,
     coordination: net.meanCoordination(w.state),
     bondSpread: net.lengthSpread(),
-    diffusion: w.diffusion().D,
-    diffusionR2: w.diffusion().r2,
+    diffusion: diffusionResult.D,
+    diffusionR2: diffusionResult.r2,
+    diffusionLagStart: diffusionResult.lagRange[0],
+    diffusionLagEnd: diffusionResult.lagRange[1],
     msdReady: w.msdReady,
     msdProgress: w.msdProgress,
     msdOriginCount: w.msd.originCount,

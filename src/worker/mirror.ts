@@ -270,13 +270,18 @@ export class WorldMirror {
 
   /** Коэффициент диффузии и качество подгонки. */
   diffusion(): { D: number; r2: number; lagRange: [number, number] } {
-    const lag = this.frame.curves.msdLag;
     return {
       D: this.frame.summary.diffusion,
       r2: this.frame.summary.diffusionR2,
-      // Границы окна в кадр не передаются: панель использует их только для
-      // подсветки участка подгонки, и без них график остаётся верным.
-      lagRange: [0, lag[lag.length - 1] ?? 0],
+      /*
+       * Границы участка фита.
+       *
+       * Раньше здесь возвращался весь диапазон лагов: считалось, что без
+       * подсветки «график остаётся верным». Формально да, но игрок видел
+       * подсвеченным весь график — то есть неправду о том, где именно
+       * измерена прямая, по которой посчитан D. Теперь участок передаётся.
+       */
+      lagRange: [this.frame.summary.diffusionLagStart, this.frame.summary.diffusionLagEnd],
     };
   }
 
