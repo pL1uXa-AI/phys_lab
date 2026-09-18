@@ -128,6 +128,10 @@ export class App {
    */
   private desiredCount: number | null = null;
   private desiredDensity: number | null = null;
+  /** Каким было число частиц до запроса на пересборку. */
+  private countBeforeRequest = -1;
+  /** До какого момента ждать подтверждения заказа на число частиц. */
+  private countRequestUntil = 0;
   /** Интервал между кадрами для честной подписи частоты кадров. */
   private frameIntervalMs = 0;
   /** Предыдущая точка замера скорости шагов. */
@@ -734,11 +738,23 @@ export class App {
     this.showNotice(`S(k) выгружен, кадров: ${samples}`);
   }
 
-  /** Сохранить график в PNG. */
-  private exportPlot(which: 'temperature' | 'energy' | 'radial'): void {
+  /**
+   * Сохранить график в PNG.
+   *
+   * Доступны все пять графиков: раньше отсюда можно было выгрузить только три
+   * (`T`, энергия, g(r)`), хотя S(k) и MSD — самые показательные кривые
+   * (пик S(k) отличает кристалл от жидкости, наклон MSD даёт D). Заодно у
+   * функции не было ни одной кнопки в интерфейсе.
+   */
+  private exportPlot(which: 'temperature' | 'energy' | 'radial' | 'structure' | 'msd'): void {
     const canvas =
-      which === 'temperature' ? this.plotT : which === 'energy' ? this.plotE : this.plotR;
+      which === 'temperature' ? this.plotT
+      : which === 'energy' ? this.plotE
+      : which === 'radial' ? this.plotR
+      : which === 'structure' ? this.plotS
+      : this.plotM;
     downloadDataUrl(timestampedName(`phys-lab-${which}`, 'png'), canvasToPng(canvas));
+    this.showNotice(`График сохранён: ${which}.png`);
   }
 
   /**
@@ -801,6 +817,30 @@ export class App {
     window.clearTimeout(this.countTimer);
     this.pendingCount = null;
     this.desiredCount = count;
+    /*
+     * Запоминаем, ОТКУДА пересобираем.
+     *
+     * ГЦК округляет число частиц до 4n³, поэтому запрошенное значение почти
+     * никогда не совпадёт с фактическим: 3456 превращается в 4000. Первая
+     * версия ждала точного совпадения `мир.count === desiredCount` — и
+     * «заказанное» значение не сбрасывалось НИКОГДА. Ползунок залипал на
+     * 3456 и продолжал врать даже после смены пресета (мир уже 2048, а
+     * подпись показывала 3456). Замерено в браузере.
+     *
+     * Поэтому признак подтверждения — не совпадение, а ИЗМЕНЕНИЕ числа
+     * относительно того, каким оно было на момент запроса.
+     */
+    this.countBeforeRequest = this.world.state.count;
+    /*
+     * Страховка по времени.
+     *
+     * Есть крайний случай: игрок просит число, которое ГЦК округляет обратно
+     * к текущему (текущее 4000, просим 3456 → снова 4000). Тогда «мир
+     * изменился» не наступает никогда, и без ограничения ползунок залип бы
+     * навсегда. Через секунду ожидания считаем, что заказ выполнен, и дальше
+     * показываем то, что действительно в мире.
+     */
+    this.countRequestUntil = performance.now() + 1000;
     this.bridge.resize(count, this.world.params.density, 'fcc');
     this.afterRebuild();
   }
@@ -1439,9 +1479,17 @@ export class App {
    */
   private syncControls(): void {
     this.bindings.temperature?.set(this.world.params.temperature);
-    // Число частиц: у ГЦК оно округляется до 4n³, поэтому сверяемся с миром,
-    // как только он подтвердил заказ.
-    if (this.desiredCount !== null && this.world.state.count === this.desiredCount) {
+    /*
+     * Число частиц: у ГЦК оно округляется до 4n³, поэтому «заказанное»
+     * значение снимается не по совпадению, а по факту пересборки: как только
+     * мир показал ДРУГОЕ число, чем было до запроса, значит заказ выполнен и
+     * дальше ползунок обязан следовать за миром.
+     */
+    if (
+      this.desiredCount !== null &&
+      (this.world.state.count !== this.countBeforeRequest ||
+        performance.now() > this.countRequestUntil)
+    ) {
       this.desiredCount = null;
     }
     this.bindings.count?.set(this.desiredCount ?? this.world.state.count);

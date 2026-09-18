@@ -70,7 +70,7 @@ export interface PanelActions {
   /** Выгрузить S(k) в CSV. */
   exportStructure(): void;
   /** Сохранить график в PNG. */
-  exportPlot(which: 'temperature' | 'energy' | 'radial'): void;
+  exportPlot(which: 'temperature' | 'energy' | 'radial' | 'structure' | 'msd'): void;
   /** Начать или остановить эксперимент с фазовым переходом. */
   toggleExperiment(): void;
   /** Переключить ветвь эксперимента (нагрев или охлаждение). */
@@ -456,16 +456,31 @@ export function dataPanel(actions: PanelActions): HTMLElement {
       { class: 'row' },
       button('S(k) → CSV', actions.exportStructure),
     ),
+    /*
+     * Графики в PNG.
+     *
+     * Функция была реализована и обещана в README, но кнопки не существовало:
+     * `exportPlot` вызывался только из публичного API, а в панели стояло
+     * `void actions.exportPlot` — заглушка от предупреждения компилятора.
+     * То есть возможность была, а дотянуться до неё из интерфейса нельзя.
+     */
+    h(
+      'div',
+      { class: 'row' },
+      button('T* → PNG', () => actions.exportPlot('temperature')),
+      button('Энергия → PNG', () => actions.exportPlot('energy')),
+      button('g(r) → PNG', () => actions.exportPlot('radial')),
+    ),
     h(
       'p',
       { class: 'hint' },
       'Сохранённый JSON восстанавливает состояние точно: продолжение даёт ту же ' +
         'траекторию, включая случайные числа термостата. Экспорт CSV открывается ' +
-        'в Excel (разделитель — точка с запятой, кодировка UTF-8 с BOM).',
+        'в Excel (разделитель — точка с запятой, кодировка UTF-8 с BOM). ' +
+        'PNG — снимок графика для отчёта или презентации.',
     ),
     fileInput,
   );
-  void actions.exportPlot;
   return panel('Данные', body, { id: 'data', collapsed: true });
 }
 

@@ -1678,6 +1678,52 @@ async function main() {
       `закрашенных пикселей: ${extraPlots.msd}`,
     );
 
+    /* --- 21f. Экспорт графиков в PNG доступен из интерфейса --- */
+    /*
+     * Функция `exportPlot` была реализована и обещана в README, но ни одной
+     * кнопки для неё в панели не существовало: в коде стояла заглушка
+     * `void actions.exportPlot`. То есть возможность была, а дотянуться до неё
+     * из интерфейса — нет. Проверка ловит именно это: не «функция есть», а
+     * «кнопка есть и по нажатию скачивается непустая картинка».
+     */
+    const png = await client.evaluate(`
+      (async () => {
+        const panel = document.querySelector('[data-panel="data"]');
+        if (!panel) return { error: 'нет панели «Данные»' };
+        const labels = [...panel.querySelectorAll('button')].map((b) => b.textContent);
+        const pngButtons = labels.filter((l) => l.includes('→ PNG'));
+        if (pngButtons.length === 0) return { error: 'кнопок PNG нет', labels };
+
+        // Перехватываем скачивание: в headless файл никуда не сохраняется,
+        // и без перехвата «работает» осталось бы непроверенным.
+        const seen = [];
+        const original = HTMLAnchorElement.prototype.click;
+        HTMLAnchorElement.prototype.click = function () {
+          if (this.download) seen.push({ name: this.download, bytes: Math.round((this.href.length - 22) * 3 / 4) });
+          else original.call(this);
+        };
+        for (const label of pngButtons) {
+          const btn = [...panel.querySelectorAll('button')].find((b) => b.textContent === label);
+          btn?.click();
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        HTMLAnchorElement.prototype.click = original;
+        return { pngButtons, seen };
+      })()
+    `, 120000);
+    check(
+      'графики выгружаются в PNG кнопками из панели',
+      !png.error &&
+        png.pngButtons?.length >= 3 &&
+        png.seen?.length === png.pngButtons.length &&
+        // Пустой PNG тоже был бы «скачан»: размер отличает картинку от пустышки.
+        png.seen.every((f) => f.bytes > 2000),
+      png.error
+        ? String(png.error)
+        : `кнопок ${png.pngButtons.length}, скачано ${png.seen.length}: ` +
+          png.seen.map((f) => `${f.name} ~${f.bytes}Б`).join(', '),
+    );
+
     /* --- 21f. D и S(k) различают фазы количественно --- */
     // Прогон намеренно короткий: проверяется НЕ точность D (для неё нужны
     // тысячи шагов и это уже сделано в юнит-тестах), а что величины вообще
