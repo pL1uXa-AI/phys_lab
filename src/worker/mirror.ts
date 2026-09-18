@@ -334,12 +334,18 @@ function makeHistory(curves: FrameCurves): MirrorHistory {
         kinetic: curves.historyKinetic[index],
         potential: curves.historyPotential[index],
         total: curves.historyTotal[index],
-        // Давление, пик g(r) и подвижность в кадр истории не кладутся: их
-        // графиков в приложении нет, а сводка берёт последние значения из
-        // `summary`, поэтому нули здесь ни на что не влияют.
-        pressure: 0,
-        orderPeak: 0,
-        mobileFraction: 0,
+        /*
+         * Давление, пик g(r) и подвижность.
+         *
+         * Раньше здесь стояли нули «потому что графиков нет». Это оказалось
+         * тихой потерей данных: те же замеры выгружаются в CSV, и в режиме
+         * воркера три столбца из восьми уходили нулями, тогда как в локальном
+         * режиме были заполнены. Измерено: P* — 0 непустых значений против
+         * 923 в локальном режиме, и файл при этом выглядел нормальным.
+         */
+        pressure: curves.historyPressure[index],
+        orderPeak: curves.historyOrderPeak[index],
+        mobileFraction: curves.historyMobileFraction[index],
       };
     },
     series(key: MirrorSeriesKey, maxPoints = 720): { t: number[]; v: number[] } {
@@ -366,6 +372,14 @@ function seriesValue(curves: FrameCurves, key: MirrorSeriesKey, index: number): 
       return curves.historyPotential[index];
     case 'total':
       return curves.historyTotal[index];
+    // Эти ряды доступны так же, как остальные: раньше здесь возвращался ноль,
+    // и панель, попросив ряд, молча получала пустую линию.
+    case 'pressure':
+      return curves.historyPressure[index];
+    case 'orderPeak':
+      return curves.historyOrderPeak[index];
+    case 'mobileFraction':
+      return curves.historyMobileFraction[index];
     default:
       return 0;
   }

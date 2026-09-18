@@ -410,6 +410,52 @@ describe('зеркало: чтение совпадает с настоящим 
     expect(Number.isFinite(series.v[series.v.length - 1])).toBe(true);
   });
 
+  it('зеркало отдаёт ВСЕ столбцы истории, а не нули вместо части из них', () => {
+    /*
+     * Регрессия с тихой потерей данных.
+     *
+     * Давление, пик g(r) и доля подвижных сначала не кладывались в кадр:
+     * «их графиков в приложении нет». Но те же замеры выгружаются в CSV, и в
+     * режиме воркера три столбца из восьми уходили нулями, тогда как в
+     * локальном режиме были заполнены. Внешне файл выглядел нормальным —
+     * поэтому дефект и жил.
+     *
+     * Проверка сравнивает зеркало с настоящим миром по КАЖДОМУ столбцу:
+     * расхождение хотя бы в одном снова сделало бы выгрузку неполной.
+     */
+    const world = makeWorld();
+    world.run(400);
+    /*
+     * Первый пик g(r) заполняется только на кадре статистики: без явного
+     * `sampleRadial` он остаётся нулём, и проверка «мир обязан заполнять
+     * orderPeak» падала бы — но по вине теста, а не кода. Здесь статистика
+     * собирается так же, как это делает приложение.
+     */
+    for (let i = 0; i < 6; i++) {
+      world.run(20);
+      world.sampleRadial();
+    }
+    const mirror = new WorldMirror(localFrame(world));
+    expect(mirror.history.size).toBeGreaterThan(0);
+
+    const columns = ['temperature', 'kinetic', 'potential', 'total', 'pressure', 'orderPeak', 'mobileFraction'] as const;
+    for (const key of columns) {
+      const worldSeries = world.history.series(key);
+      const mirrorSeries = mirror.history.series(key);
+      let worldSum = 0;
+      let mirrorSum = 0;
+      for (const value of worldSeries.v) worldSum += Math.abs(value);
+      for (const value of mirrorSeries.v) mirrorSum += Math.abs(value);
+      expect(worldSum, `мир обязан заполнять ${key}`).toBeGreaterThan(0);
+      expect(mirrorSum, `зеркало потеряло столбец ${key}`).toBeGreaterThan(0);
+    }
+
+    // И через `get` тоже: по нему собирается CSV на экспорт.
+    const last = mirror.history.get(mirror.history.size - 1);
+    expect(last?.pressure).not.toBe(0);
+    expect(last?.mobileFraction).toBeGreaterThan(0);
+  });
+
   it('история отдаёт нужные ряды и не врёт про размер', () => {
     const world = makeWorld();
     world.run(200);

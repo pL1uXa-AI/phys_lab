@@ -178,6 +178,22 @@ export interface FrameCurves {
   historyKinetic: Float64Array;
   historyPotential: Float64Array;
   historyTotal: Float64Array;
+  /*
+   * Давление, первый пик g(r) и доля подвижных частиц.
+   *
+   * Их графиков в приложении нет, и сначала они в кадр не кладывались —
+   * «сводка берёт последние значения из summary, значит нули ни на что не
+   * влияют». Это оказалось неверно: те же замеры выгружаются в CSV, и в
+   * режиме воркера три столбца из восьми молча уходили нулями, тогда как в
+   * локальном режиме были заполнены. Проверено замером: P* — 0 непустых
+   * значений против 923 в локальном режиме.
+   *
+   * Стоимость — 3 × HISTORY_POINTS чисел на кадр (около 8 КБ), это дешевле,
+   * чем файл с потерянными данными.
+   */
+  historyPressure: Float64Array;
+  historyOrderPeak: Float64Array;
+  historyMobileFraction: Float64Array;
 }
 
 /** Сводные величины кадра: всё, что интерфейс показывает числами. */
@@ -283,6 +299,9 @@ export function buildCurves(world: {
   const historyKinetic = new Float64Array(take);
   const historyPotential = new Float64Array(take);
   const historyTotal = new Float64Array(take);
+  const historyPressure = new Float64Array(take);
+  const historyOrderPeak = new Float64Array(take);
+  const historyMobileFraction = new Float64Array(take);
   const stride = size > 0 ? size / take : 1;
   for (let i = 0; i < take; i++) {
     const sample = world.history.get(Math.min(size - 1, Math.floor(i * stride)));
@@ -292,6 +311,9 @@ export function buildCurves(world: {
     historyKinetic[i] = sample.kinetic;
     historyPotential[i] = sample.potential;
     historyTotal[i] = sample.total;
+    historyPressure[i] = sample.pressure;
+    historyOrderPeak[i] = sample.orderPeak;
+    historyMobileFraction[i] = sample.mobileFraction;
   }
 
   return {
@@ -306,6 +328,9 @@ export function buildCurves(world: {
     historyKinetic,
     historyPotential,
     historyTotal,
+    historyPressure,
+    historyOrderPeak,
+    historyMobileFraction,
   };
 }
 
@@ -316,4 +341,8 @@ export interface HistorySampleLike {
   kinetic: number;
   potential: number;
   total: number;
+  /** Давление, первый пик g(r) и доля подвижных — нужны для выгрузки в CSV. */
+  pressure: number;
+  orderPeak: number;
+  mobileFraction: number;
 }
